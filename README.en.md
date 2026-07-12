@@ -33,6 +33,16 @@ When you ask an ordinary language model to answer from your document, there are 
 
 MemoBase closes both gaps. Think of it as **NotebookLM, but local and right inside the agent**: you upload sources, and the plugin answers **using only what is actually in them** — with a verbatim quote, source, and page/section (or a timecode, for video and audio) attached to every claim. If the answer isn't in the base, MemoBase says so honestly ("this isn't in the knowledge base yet") instead of guessing.
 
+### What it fixes
+
+- **The agent confidently invents facts that aren't there.** → "Quote or refuse", enforced in code: every citation is matched verbatim against the source — no match, no answer.
+- **You copy-paste chunks of PDFs and articles into the chat by hand.** → Drop in a file, a web page or a video — the plugin parses the source itself and searches it instantly.
+- **Keyword search misses the meaning, while pure vector search loses exact words, codes, names.** → A hybrid of FTS5 + vector, fused with RRF: it finds by meaning *and* by the exact term.
+- **Your documents leave for someone else's cloud.** → Everything lives in one local SQLite file; in fully-local mode nothing leaves your machine at all.
+- **The RAG stack is heavy: PyTorch, gigabytes of weights, a toxic AGPL license — it won't fit a cheap VPS.** → No PyTorch, no AGPL, installs in seconds.
+- **Mandatory paid keys.** → A local ONNX embedder (fastembed): search works with no keys at all.
+- **Video and voice notes aren't searchable — transcribe them by hand.** → Whisper with real timecodes, whole YouTube channels, voice notes, Obsidian — all in one index.
+
 Under the hood is a four-stage no-hallucination loop:
 
 1. **Sufficiency gate.** Before the model is even allowed to answer, MemoBase checks whether search found a confidently relevant fragment. If not, it's an honest refusal — before generation.
