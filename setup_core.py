@@ -502,7 +502,7 @@ def install_local_embedder(model: str = LOCAL_EMBED_MODEL) -> Tuple[bool, str]:
 
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "fastembed"],
+            [sys.executable, "-m", "pip", "install", "--upgrade", "fastembed>=0.6"],
             check=True,
         )
     except Exception as exc:  # noqa: BLE001 - onboarding must never crash

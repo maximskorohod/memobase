@@ -122,7 +122,9 @@ if ($LASTEXITCODE -ne 0) {
 if ($Local) {
     Write-Host ""
     Write-Host "MemoBase: ставлю локальный эмбеддер (fastembed - ONNX Runtime, без PyTorch)..." -ForegroundColor Cyan
-    & $python -m pip install --upgrade fastembed
+    # fastembed>=0.6: e5-large обучена под mean pooling; fastembed<=0.5.1 применял CLS -
+    # другой вектор-спейс. Порог фиксирует протестированное поведение для новых баз.
+    & $python -m pip install --upgrade "fastembed>=0.6"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "MemoBase: установка fastembed не удалась (см. вывод pip выше)." -ForegroundColor Red
         exit $LASTEXITCODE

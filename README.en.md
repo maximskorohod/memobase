@@ -117,6 +117,8 @@ flowchart LR
 
 ## Installation
 
+> **Installing via the hermes Telegram bot?** Send the plugin archive into the chat and ask it to "unpack and install using the instructions inside" — the agent will follow [`AGENTS.md`](AGENTS.md). The manual terminal install is below.
+
 One command: the plugin gets copied into place, dependencies get installed, and `memobase` gets enabled in `config.yaml` — nothing left to configure by hand.
 
 1. Download/clone this folder anywhere — no need to place it under `<HERMES_HOME>/plugins/` yourself, the script copies it there.

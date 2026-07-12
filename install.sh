@@ -119,7 +119,9 @@ echo "MemoBase: устанавливаю зависимости в $PYTHON"
 if [ "$INSTALL_LOCAL" = "1" ]; then
     echo ""
     echo "MemoBase: ставлю локальный эмбеддер (fastembed — ONNX Runtime, без PyTorch)..."
-    "$PYTHON" -m pip install --upgrade fastembed
+    # fastembed>=0.6: e5-large обучена под mean pooling; fastembed<=0.5.1 применял CLS —
+    # другой вектор-спейс. Порог фиксирует протестированное поведение для новых баз.
+    "$PYTHON" -m pip install --upgrade "fastembed>=0.6"
     echo "MemoBase: скачиваю модель intfloat/multilingual-e5-large (~2.2 ГБ, один раз)..."
     "$PYTHON" - <<'PYEOF'
 from fastembed import TextEmbedding
