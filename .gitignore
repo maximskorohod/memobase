@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[codz]
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Environments / secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+
+# Databases (runtime state, never ship real user data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite*
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp

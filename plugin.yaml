@@ -1,0 +1,77 @@
+name: memobase
+version: 0.1.0
+description: >
+  MemoBase — локальная база знаний для hermes: загружаете документы (PDF/DOCX/HTML/MD/TXT/CSV),
+  YouTube-видео/каналы, аудио/видео-файлы (через STT) и Obsidian-vault'ы — плагин
+  строит гибридный поиск (FTS5 + вектор) и отвечает строго по базе — с цитатами
+  или честным отказом, если ответа в базе нет. Библиотекарь, не память:
+  работает одновременно с активным memory-провайдером.
+author: Maxim Vasko
+kind: standalone
+
+# NOTE (as of 2026-07-06): the
+# hermes-agent plugin loader currently consumes only
+# name/version/description/author/requires_env/provides_tools/provides_hooks/kind
+# from this manifest. `hermes_core_min_version` below is NOT enforced by the
+# loader (no such key is read anywhere in hermes_cli/plugins.py) — it is a
+# human/CI-readable compatibility note only. A real loader-side version gate would need an
+# upstream change; until then, tools.py/cli.py should self-check compatible
+# hermes-core internals defensively at runtime instead of trusting this field.
+hermes_core_min_version: "0.18.0"
+
+# Informational only — hermes does not validate
+# or auto-configure these; they must already exist in ~/.hermes/.env for the
+# embed/rerank API tiers to work. All three are confirmed present and live
+# per DESIGN_v1.md. Absent keys degrade gracefully (embed.py/rerank.py fall
+# back per their own module contracts), never crash plugin load.
+requires_env:
+  - CLOUDFLARE_ACCOUNT_ID
+  - CLOUDFLARE_API_TOKEN
+  - COHERE_API_KEY
+  # Ingestion-source ladder (youtube.py/stt.py) — all optional: each
+  # source_type degrades to an honest "skipped" reason (never a crash) if
+  # its key is absent, per extract.py's own "never raises" contract.
+  - SCRAPECREATORS_API_KEY  # youtube.py: channel listing + transcripts (primary)
+  - APIFY_TOKEN             # youtube.py: transcript/channel-listing fallback + audio download
+  - GROQ_API_KEY            # stt.py: whisper-large-v3-turbo (default STT preset)
+  - GEMINI_API_KEY          # stt.py: gemini-2.5-flash-lite (STT fallback preset)
+
+# Declared ahead of implementation so the manifest documents the full v1
+# surface from DESIGN_v1.md even though tools.py/commands.py/cli.py (which
+# call ctx.register_tool/register_command/register_cli_command for these)
+# are built by other agents in this same round. register_tool() is additive
+# and idempotent per name, so this list is safe to declare early.
+provides_tools:
+  - memobase_ingest
+  - memobase_query
+  - memobase_ask
+  - memobase_list
+  - memobase_delete
+  - memobase_status
+  - memobase_selfcheck
+  - memobase_map
+  # MULTIUSER admin tools — owner/privileged-only, refused in code (not by prompt)
+  # for any resolved non-owner identity; see tools.py's `_require_privileged`.
+  - memobase_create_for
+  - memobase_share
+  - memobase_share_revoke
+  - memobase_set_guest_quota
+  - memobase_quarantine_list
+  - memobase_quarantine_review
+
+# subagent_start: session -> collection binding registry (tools.py) auto-binds
+# a freshly-delegated "librarian" child to a fixed collection, via a
+# `[[memobase:<name>]]` marker at the start of its delegate_task goal text.
+#
+# pre_gateway_dispatch: TWO independent callbacks are registered against this
+# one hook name (both from this plugin, via ctx.register_hook -- the host is
+# expected to support multiple callbacks per event; see PluginContext's
+# hooks dict being list-valued):
+#   * tools.py's `_on_gateway_dispatch` -- best-effort session_id <-> gateway
+#     user_id binding for the MULTIUSER guest ACL/quota checks (never returns
+#     an action; pure side-effect binding, always lets the message through).
+#   * wizard.py's `on_gateway_dispatch` -- intercepts `/memobase setup` and any
+#     wizard-in-progress reply BEFORE the LLM sees it (Часть 2b onboarding).
+provides_hooks:
+  - subagent_start
+  - pre_gateway_dispatch

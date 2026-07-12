@@ -1,0 +1,11 @@
+# Normalize line endings on checkout so a Windows clone still produces
+# Unix-runnable scripts (LF), while letting git auto-detect text vs binary.
+* text=auto eol=lf
+
+# Explicit: install.sh MUST stay LF even after a Windows checkout — with
+# CRLF the shebang line becomes "#!/usr/bin/env bash\r" and the script
+# fails to run on Linux/macOS ("bad interpreter").
+*.sh text eol=lf
+
+# Windows-native script: fine to keep CRLF, PowerShell doesn't care either way.
+*.ps1 text eol=crlf
