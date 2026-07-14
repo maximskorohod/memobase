@@ -57,36 +57,42 @@ class TestKeyFormatValidation:
         assert ok is False
         assert "пуст" in hint.lower()
 
-    def test_openai_requires_sk_prefix(self, kb):
+    def test_openai_accepts_any_shape(self, kb):
+        # No provider-prefix requirement anymore -- any non-empty,
+        # whitespace-free, plausible-length value passes format validation.
         ok, hint = kb.setup_core.validate_key_format("openai", "not-the-right-shape-1234567890")
-        assert ok is False
+        assert ok is True
+        assert hint == ""
 
     def test_unknown_provider_is_accepted_as_is(self, kb):
         ok, hint = kb.setup_core.validate_key_format("mystery-provider", "anything at all")
         assert ok is True
         assert hint == ""
 
-    # --- wrong-key-type re-ask (the actual "detects wrong-key-type" gap) ---
+    # --- cross-provider shapes are no longer flagged as "wrong key type" ---
+    # (_OTHER_KEY_SHAPES is now [] -- classify_key_mismatch always returns
+    # None; a genuinely wrong key is still caught downstream by the live
+    # check, just not by this format-only gate.)
 
-    def test_openai_shaped_key_rejected_when_asked_for_cloudflare(self, kb):
+    def test_openai_shaped_key_accepted_when_asked_for_cloudflare(self, kb):
         ok, hint = kb.setup_core.validate_key_format("cloudflare", "sk-thisIsAnOpenAiShapedKey123456")
-        assert ok is False
-        assert "OpenAI" in hint
+        assert ok is True
+        assert hint == ""
 
-    def test_groq_shaped_key_rejected_when_asked_for_cohere(self, kb):
+    def test_groq_shaped_key_accepted_when_asked_for_cohere(self, kb):
         ok, hint = kb.setup_core.validate_key_format("cohere", "gsk_thisIsAGroqShapedToken1234567890")
-        assert ok is False
-        assert "Groq" in hint
+        assert ok is True
+        assert hint == ""
 
-    def test_gemini_shaped_key_rejected_when_asked_for_openai(self, kb):
+    def test_gemini_shaped_key_accepted_when_asked_for_openai(self, kb):
         ok, hint = kb.setup_core.validate_key_format("openai", "AIzaSyFAKEGEMINIKEY0123456789abcdefghi")
-        assert ok is False
-        assert "Gemini" in hint or "Google" in hint
+        assert ok is True
+        assert hint == ""
 
-    def test_apify_shaped_token_rejected_when_asked_for_cloudflare(self, kb):
+    def test_apify_shaped_token_accepted_when_asked_for_cloudflare(self, kb):
         ok, hint = kb.setup_core.validate_key_format("cloudflare", "apify_api_FAKE1234567890abcdef")
-        assert ok is False
-        assert "Apify" in hint
+        assert ok is True
+        assert hint == ""
 
     def test_own_shape_is_not_flagged_as_mismatch(self, kb):
         # openai's OWN expected shape starts with "sk-" -- must not flag itself.

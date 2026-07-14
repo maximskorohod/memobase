@@ -80,8 +80,8 @@ CLOUD_KEY_FIELDS: Dict[str, KeyField] = {
             "Это как читательский билет в одну конкретную библиотеку — Cloudflare "
             "Workers AI: билет открывает дверь только туда и ни на что больше."
         ),
-        format_hint="обычно 30-40 латинских букв/цифр/дефисов/подчёркиваний, без пробелов",
-        format_re=re.compile(r"^[A-Za-z0-9_-]{20,60}$"),
+        format_hint="непустая строка без пробелов (cfat_… или cfut_… — оба ок)",
+        format_re=re.compile(r"^\S{8,200}$"),
     ),
     "cohere": KeyField(
         env_var="COHERE_API_KEY",
@@ -90,15 +90,15 @@ CLOUD_KEY_FIELDS: Dict[str, KeyField] = {
             "Это как абонемент в сервис, который переводит текст на язык чисел "
             "(эмбеддинги) — без абонемента Cohere на порог не пустит."
         ),
-        format_hint="обычно 40 латинских букв/цифр/дефисов/подчёркиваний, без пробелов",
-        format_re=re.compile(r"^[A-Za-z0-9_-]{20,60}$"),
+        format_hint="непустая строка без пробелов",
+        format_re=re.compile(r"^\S{8,200}$"),
     ),
     "openai": KeyField(
         env_var="OPENAI_API_KEY",
         label="ключ OpenAI-совместимого сервиса (OPENAI_API_KEY)",
         metaphor="Это как персональный пропуск на проходной: пускает только вас и никого больше.",
-        format_hint="начинается с «sk-», дальше латинские буквы/цифры/дефисы/подчёркивания",
-        format_re=re.compile(r"^sk-[A-Za-z0-9_-]{10,}$"),
+        format_hint="непустая строка без пробелов (обычно sk-…, но зависит от сервера)",
+        format_re=re.compile(r"^\S{8,200}$"),
     ),
 }
 
@@ -107,19 +107,13 @@ CLOUD_KEY_FIELDS: Dict[str, KeyField] = {
 # catalog above so it is never hand-maintained twice.
 CLOUD_KEY_ENV: Dict[str, str] = {p: f.env_var for p, f in CLOUD_KEY_FIELDS.items()}
 
-# Other services hermes (or memobase itself) can use, recognized by a
-# distinctive prefix — used ONLY for wrong-key-type cross-detection: if
-# someone pastes an OpenAI key while asked for a Cloudflare token, this
-# catches it instead of silently saving the wrong secret under the wrong
-# name. Not exhaustive on purpose — Cloudflare/Cohere tokens have no public,
-# stable prefix to recognize each other by, so those two can only be
-# cross-checked against services that DO have one.
-_OTHER_KEY_SHAPES: List[Tuple[str, Any, str]] = [
-    ("OPENAI_API_KEY", re.compile(r"^sk-"), "OpenAI"),
-    ("GROQ_API_KEY", re.compile(r"^gsk_"), "Groq"),
-    ("GEMINI_API_KEY", re.compile(r"^AIzaSy"), "Gemini/Google"),
-    ("APIFY_TOKEN", re.compile(r"^apify_api_"), "Apify"),
-]
+# Cross-detection by provider prefix is intentionally disabled: providers change
+# their prefixes (e.g. Gemini now issues AQ.… keys, not just AIzaSy…), so keying
+# "you pasted the wrong key type" off a prefix produced false rejections of
+# perfectly valid keys. A genuinely wrong key is still caught downstream by the
+# live check. Kept as an empty list so classify_key_mismatch() and its callers
+# keep working unchanged (it now simply never reports a mismatch).
+_OTHER_KEY_SHAPES: List[Tuple[str, Any, str]] = []
 
 
 def classify_key_mismatch(target_env_var: str, value: str) -> Optional[str]:
