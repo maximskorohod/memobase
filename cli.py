@@ -117,7 +117,7 @@ def _handle(args) -> None:
                 f"Переиндексация завершена: {result.get('chunks_embedded', 0)} фрагмент(ов) переэмбеддено, "
                 f"векторный индекс готов: {result.get('vector_index_ready')}."
             )
-        except embed_mod.EmbedError as exc:
+        except (embed_mod.EmbedError, db.DbError) as exc:
             print(f"Ошибка переиндексации: {exc}")
         finally:
             conn.close()
@@ -259,6 +259,7 @@ def _run_cli_setup_wizard() -> None:
     print()
     print(setup_core.detect_obsidian_message())
     print("Готово. Дальше: `hermes memobase ingest <файл> <тип>`, `hermes memobase list`, `hermes memobase status`.")
+    print(setup_core.restart_hint())
 
 
 def register(ctx) -> None:

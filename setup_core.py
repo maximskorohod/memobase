@@ -475,8 +475,44 @@ def control_question_question() -> str:
     return "Загрузка принята. Задайте любой вопрос по загруженному — я отвечу с цитатой из базы."
 
 
+def restart_hint() -> str:
+    """RU one-liner explaining how to make a freshly-saved key actually
+    reach a running hermes -- appended to both onboarding UIs' "done" text
+    (:func:`done_message`, used by the Telegram wizard, and directly by
+    cli.py's terminal ``hermes memobase setup``).
+
+    The correct instruction depends on how the gateway process is
+    supervised (bug B12, "systemd .env gap"): a systemd --user
+    ``hermes-gateway.service`` builds its environment once at unit start
+    and never re-reads ``.env`` on its own, so a plain ``hermes gateway
+    restart`` only picks up a newly-saved key if install.sh's systemd
+    drop-in (:func:`systemd_env.wire_gateway_env`) is in place -- detected
+    live here, never assumed. Off systemd (plain CLI/foreground session),
+    ``.env`` is simply inherited on the next process start, no
+    systemd-specific caveat applies.
+
+    Never raises: :func:`systemd_env.detect_systemd_gateway` already
+    degrades to ``False`` on its own, but this is wrapped defensively too
+    since it runs inside "must never crash the onboarding flow" call sites.
+    """
+    try:
+        from . import systemd_env
+
+        under_systemd = systemd_env.detect_systemd_gateway()
+    except Exception:
+        under_systemd = False
+
+    if under_systemd:
+        return (
+            "Перезапустите gateway: `hermes gateway restart` — ключи из .env подхватятся "
+            "(systemd EnvironmentFile настроен)."
+        )
+    return "Перезапустите hermes, чтобы подхватить ключи из .env."
+
+
 def done_message() -> str:
-    return "Настройка завершена. Шпаргалка: спросить — просто вопросом; добавить — «добавь в базу ...»; статус — /memobase status."
+    base = "Настройка завершена. Шпаргалка: спросить — просто вопросом; добавить — «добавь в базу ...»; статус — /memobase status."
+    return f"{base} {restart_hint()}"
 
 
 def local_embedder_model() -> str:

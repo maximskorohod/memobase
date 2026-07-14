@@ -350,10 +350,11 @@ def reembed_collection_shadow(
     the shadow vec table (``vec_c{id}_v2``) using *new_cfg*'s embedder, then
     atomically promote it live and flip ``collections.migration_state``.
 
-    Sequence: mark 'migrating' -> create+fill shadow table -> atomic
-    ``db.swap_vec_table`` -> update ``collections`` embedder columns +
-    every live chunk's ``embed_signature`` -> mark 'idle'. On ANY failure,
-    marks 'failed' (never left stuck at 'migrating') and re-raises.
+    Sequence: mark 'migrating' -> drop stale shadow table (if any) ->
+    create+fill shadow table -> atomic ``db.swap_vec_table`` -> update
+    ``collections`` embedder columns + every live chunk's
+    ``embed_signature`` -> mark 'idle'. On ANY failure, marks 'failed'
+    (never left stuck at 'migrating') and re-raises.
 
     retrieve.py/answer.py (built separately) are expected to treat a
     non-'idle' ``migration_state`` as "serve FTS-only or block with a
@@ -372,6 +373,16 @@ def reembed_collection_shadow(
 
     _set_migration_state(conn, collection_id, "migrating")
     try:
+        # Drop a stale shadow table left behind by a previous FAILED reindex
+        # of THIS collection before (re)creating it -- `ensure_vec_table`'s
+        # `CREATE ... IF NOT EXISTS` would otherwise silently reuse a shadow
+        # table that may still hold rows (and a different dimensionality)
+        # from that earlier, abandoned run. `safe_drop_vec_table` (not a bare
+        # DROP) because that stale shadow -- and any orphaned `vec_c{id}_v2_*`
+        # companion tables from a DB that once ran the old rename-based swap
+        # (B11) -- may be CORRUPT and undroppable by a plain DROP TABLE.
+        with conn:
+            db.safe_drop_vec_table(conn, db.vec_table_name(collection_id, shadow=True))
         vec_ready = db.ensure_vec_table(conn, collection_id, dims, shadow=True)
         chunks = conn.execute(
             "SELECT id, text FROM chunks WHERE collection_id = ? AND tombstoned_at IS NULL ORDER BY id",
@@ -392,7 +403,7 @@ def reembed_collection_shadow(
                             (row["id"], serialize_vector(vec)),
                         )
                 embedded_count += len(batch)
-            db.swap_vec_table(conn, collection_id)
+            db.swap_vec_table(conn, collection_id, dims)
         else:
             logger.warning(
                 "sqlite-vec unavailable; migration for collection %s updates embedder config/"

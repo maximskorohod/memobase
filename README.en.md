@@ -152,6 +152,11 @@ One command: the plugin gets copied into place, dependencies get installed, and 
    /memobase status
    ```
 
+   If hermes-gateway runs as a `systemd --user` unit, the installer already wired an
+   `EnvironmentFile` drop-in — newly-saved keys in `.env` take effect on `hermes gateway
+   restart`, no manual unit edit needed. In a plain CLI session, `.env` is simply
+   inherited on the next hermes start.
+
 The plugin works immediately in keyword mode (FTS5 full-text search, no key required). The keys in the table below unlock semantic search and extra sources — without them the corresponding capability honestly degrades or is skipped rather than crashing the plugin:
 
    | Key | Purpose | When you need it |

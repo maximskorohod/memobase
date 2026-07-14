@@ -351,7 +351,7 @@ def connect(db_path: Optional[Path] = None, *, read_only: bool = False) -> sqlit
     # table does not make it available on a different, later connection to
     # the same memobase.db. Without this, any fresh connection that touches an
     # EXISTING vec0 table (e.g. delete_collection()'s "DROP TABLE
-    # vec_c{id}", or swap_vec_table()'s rename) fails with sqlite3's
+    # vec_c{id}", or swap_vec_table()'s drop/create/copy) fails with sqlite3's
     # "no such module: vec0", even though the table genuinely exists and
     # was created successfully by an earlier connection. Harmless/no-op
     # when the sqlite_vec package isn't installed (load_sqlite_vec never
@@ -549,23 +549,168 @@ def vec_table_exists(conn: sqlite3.Connection, collection_id: int, *, shadow: bo
     return row is not None
 
 
-def swap_vec_table(conn: sqlite3.Connection, collection_id: int) -> None:
-    """Atomically promote the shadow table (``vec_c{id}_v2``) to live
-    (``vec_c{id}``), for the embedding-migration flow. Caller (embed.py) is
-    responsible for having fully re-embedded into the shadow table and
-    updating ``collections.migration_state``/embed_signature BEFORE calling
-    this — this function only does the rename, inside one transaction so
-    readers never observe a half-swapped state.
+# Real shadow-table schema templates for sqlite-vec's ``vec0``, keyed by the
+# companion-table suffix. A vec0 virtual table ``{t}`` keeps its actual state
+# in four ordinary SQLite tables named ``{t}_chunks`` / ``{t}_info`` /
+# ``{t}_rowids`` / ``{t}_vector_chunks00`` (larger tables add
+# ``_vector_chunks01`` … partitions). Their structure is identical across
+# collections and embedding dimensionalities -- the dimensionality lives as
+# DATA inside ``_info``, and vectors are opaque BLOBs -- so these exact CREATE
+# statements are safe to (re)create for ANY vec table name. Captured verbatim
+# from sqlite-vec 0.1.9's own ``sqlite_master`` rows.
+_VEC_SHADOW_SCHEMAS = {
+    "_chunks": 'CREATE TABLE IF NOT EXISTS "{t}_chunks"(chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,size INTEGER NOT NULL,validity BLOB NOT NULL,rowids BLOB NOT NULL)',
+    "_info": 'CREATE TABLE IF NOT EXISTS "{t}_info" (key text primary key, value any)',
+    "_rowids": 'CREATE TABLE IF NOT EXISTS "{t}_rowids"(rowid INTEGER PRIMARY KEY AUTOINCREMENT,id,chunk_id INTEGER,chunk_offset INTEGER)',
+    "_vector_chunks00": 'CREATE TABLE IF NOT EXISTS "{t}_vector_chunks00"(rowid PRIMARY KEY,vectors BLOB NOT NULL)',
+}
+
+_VEC_VECTOR_CHUNK_RE = re.compile(r"^vector_chunks\d+$")
+
+
+def _vec_companion_tables(conn: sqlite3.Connection, table: str) -> List[str]:
+    """Return the ordinary shadow/companion tables belonging to vec0 virtual
+    table *table* (``{table}_chunks`` / ``_info`` / ``_rowids`` /
+    ``_vector_chunksNN``), and NOTHING else.
+
+    Deliberately precise: a naive ``LIKE '{table}%'`` would also match a
+    DIFFERENT collection's tables (``vec_c11*`` for ``vec_c1``) and the
+    migration-shadow's own companions (``vec_c1_v2_*`` for ``vec_c1``) -- so
+    the SQL prefilter is only a coarse narrowing and the real decision is the
+    exact-suffix check in Python below. This is what lets
+    :func:`safe_drop_vec_table` on the LIVE name leave the shadow's own
+    ``_v2_*`` companions untouched (they get cleaned when the caller drops the
+    ``_v2`` name itself)."""
+    prefix = table + "_"
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? || '%'",
+        (table,),
+    ).fetchall()
+    out: List[str] = []
+    for row in rows:
+        name = row["name"]
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix):]
+        if rest in ("chunks", "info", "rowids") or _VEC_VECTOR_CHUNK_RE.match(rest):
+            out.append(name)
+    return out
+
+
+def safe_drop_vec_table(conn: sqlite3.Connection, table: str) -> None:
+    """DROP a vec0 virtual table tolerantly -- even one already CORRUPT from
+    the old ``ALTER TABLE ... RENAME`` bug (B11).
+
+    A healthy vec0 table drops cleanly with a plain ``DROP TABLE`` (its
+    ``xDestroy`` destructor removes its four companion tables for it). But a
+    table whose companion tables are missing/renamed (exactly what the old
+    ``swap_vec_table`` rename left behind: the renamed live table points at
+    ``{t}_chunks`` etc. that no longer exist) makes a bare ``DROP TABLE`` fail
+    with "SQL logic error" -- the destructor cannot run without its own
+    shadow tables. That would leave the NEW reindex (the very recovery path)
+    unable to drop the broken table, so re-embedding would stay wedged for
+    every user who ran the buggy reindex even once.
+
+    Recovery recipe (verified against real sqlite-vec 0.1.9): (re)create any
+    MISSING companion tables from their real schemas via ``CREATE TABLE IF
+    NOT EXISTS`` -- a no-op on a healthy table, and it does NOT clobber
+    surviving companions or their data -- and THEN issue a single
+    ``DROP TABLE``. Order matters: a bare ``DROP TABLE`` attempted FIRST and
+    allowed to fail leaves vec0's in-memory module state half-torn-down, after
+    which even a correct recreate no longer lets a retry succeed. So we always
+    ensure the companions exist BEFORE the one and only drop. Finally we sweep
+    any leftover companion tables (extra ``_vector_chunksNN`` partitions, or a
+    set of companions whose main table was already gone).
+
+    Transaction-agnostic: runs its statements on *conn* directly and lets the
+    caller own the surrounding transaction (both call sites wrap it in
+    ``with conn:``). Raises :class:`DbError` only if the main table genuinely
+    cannot be dropped even after recovery.
     """
+    if not _VEC_TABLE_NAME_RE.match(table):
+        raise DbError(f"safe_drop_vec_table: refusing unsafe table name {table!r}")
+
+    main_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
+    ).fetchone() is not None
+
+    drop_error: Optional[sqlite3.Error] = None
+    if main_exists:
+        # Ensure every companion table exists so vec0's destructor can run,
+        # THEN drop exactly once (see docstring on why order matters).
+        for tmpl in _VEC_SHADOW_SCHEMAS.values():
+            try:
+                conn.execute(tmpl.format(t=table))
+            except sqlite3.Error:
+                pass
+        try:
+            conn.execute(f"DROP TABLE {table}")
+        except sqlite3.Error as exc:
+            drop_error = exc  # fall through to the sweep + honest re-raise
+
+    # Sweep orphaned companion tables: residue the destructor did not reach,
+    # extra vector-chunk partitions, or a whole companion set left mainless by
+    # a previous broken migration.
+    for name in _vec_companion_tables(conn, table):
+        try:
+            conn.execute(f"DROP TABLE {name}")
+        except sqlite3.Error:
+            pass
+
+    still_there = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
+    ).fetchone() is not None
+    if still_there:
+        raise DbError(
+            f"failed to drop vec table {table} even after companion recovery"
+            + (f": {drop_error}" if drop_error else "")
+        )
+
+
+def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int) -> None:
+    """Atomically promote the shadow table (``vec_c{id}_v2``) to live
+    (``vec_c{id}``), for the embedding-migration flow.
+
+    Does NOT use ``ALTER TABLE ... RENAME`` -- sqlite-vec's ``vec0`` virtual
+    table module does not implement ``xRename`` (SQLite's virtual-table
+    rename callback), so renaming a vec0 table leaves it corrupt under its
+    new name (B11). Instead this (re)creates the live table under its
+    permanent name and copies rows across from the shadow table via a
+    single ``INSERT ... SELECT``, then drops the shadow table -- all inside
+    one transaction so readers never observe a half-swapped state (either
+    the old live table is gone, the new one is fully populated and the
+    shadow is gone, or nothing changed at all).
+
+    Caller (embed.py) is responsible for having fully re-embedded into the
+    shadow table and updating ``collections.migration_state``/embed_signature
+    BEFORE calling this. ``dims`` must match the shadow table's actual
+    embedding dimensionality (embed.py already has it on hand -- the same
+    ``new_cfg['embedder']['dims']`` it passed to
+    ``ensure_vec_table(..., shadow=True)`` for this same migration); there
+    is no reliable way to introspect a vec0 table's declared dimensionality
+    from SQL, so it must be passed in explicitly rather than re-derived.
+    """
+    if not isinstance(dims, int) or dims <= 0:
+        raise DbError(f"invalid dims for vec table swap: {dims!r}")
     live = vec_table_name(collection_id, shadow=False)
     shadow = vec_table_name(collection_id, shadow=True)
     if not vec_table_exists(conn, collection_id, shadow=True):
         raise DbError(f"cannot swap: shadow table {shadow} does not exist")
     try:
         with conn:
-            if vec_table_exists(conn, collection_id, shadow=False):
-                conn.execute(f"DROP TABLE {live}")
-            conn.execute(f"ALTER TABLE {shadow} RENAME TO {live}")
+            # Tolerant drop: the live table may be CORRUPT here -- if this DB
+            # ever ran the old rename-based swap, ``live`` points at companion
+            # tables that no longer exist and a plain DROP would fail (B11).
+            safe_drop_vec_table(conn, live)
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {live} USING vec0("
+                f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{dims}])"
+            )
+            conn.execute(
+                f"INSERT INTO {live}(chunk_id, embedding) "
+                f"SELECT chunk_id, embedding FROM {shadow}"
+            )
+            safe_drop_vec_table(conn, shadow)
     except sqlite3.Error as exc:
         raise DbError(f"failed to swap vec tables for collection {collection_id}: {exc}") from exc
 
@@ -646,9 +791,13 @@ def delete_collection(conn: sqlite3.Connection, collection_id: int) -> None:
             conn.execute("DELETE FROM collection_shares WHERE collection_id = ?", (collection_id,))
             conn.execute("DELETE FROM quarantine WHERE collection_id = ?", (collection_id,))
             conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+            # Tolerant drop of both vec tables: either may be CORRUPT if this
+            # DB ever ran the old rename-based swap (B11) -- a plain DROP TABLE
+            # would then fail and make the whole collection undeletable.
+            # safe_drop_vec_table is a no-op-shaped superset of a plain drop
+            # for healthy tables and also sweeps orphaned companion tables.
             for shadow in (False, True):
-                if vec_table_exists(conn, collection_id, shadow=shadow):
-                    conn.execute(f"DROP TABLE {vec_table_name(collection_id, shadow=shadow)}")
+                safe_drop_vec_table(conn, vec_table_name(collection_id, shadow=shadow))
     except sqlite3.Error as exc:
         raise DbError(f"failed to delete collection {collection_id}: {exc}") from exc
 

@@ -421,6 +421,54 @@ class TestEmbed:
         raw = kb.embed.serialize_vector([0.1, 0.2, 0.3])
         assert isinstance(raw, (bytes, bytearray))
 
+    def test_reembed_collection_shadow_swap_survives_vec0(self, kb, tmp_path, monkeypatch):
+        """B11 regression through the real reindex pipeline (embed.py ->
+        db.swap_vec_table), not just the db.py-level swap: re-embeds a real
+        ingested chunk into the shadow table and swaps it live via
+        ``reembed_collection_shadow``. Proves embed.py now passes ``dims``
+        through to ``swap_vec_table`` (a plain call-site bug there would
+        raise ``TypeError`` since ``dims`` is a required positional arg) and
+        that a KNN query against the post-swap live table still works."""
+        def _fake_embed_texts(texts, cfg, is_query=False):
+            dims = (cfg.get("embedder") or {}).get("dims") or 2
+            return [[0.3] * dims for _ in texts]
+
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed_texts)
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "reindexme", embedder_dims=2)
+            vec_ready = kb.db.ensure_vec_table(conn, cid, 2)
+            if not vec_ready:
+                pytest.skip("sqlite-vec extension not available in this environment")
+
+            row = kb.db.get_collection_by_id(conn, cid)
+            p = tmp_path / "doc.txt"
+            p.write_text("текст для переиндексации", encoding="utf-8")
+            kb.ingest.ingest_source(
+                conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly()
+            )
+
+            row = kb.db.get_collection_by_id(conn, cid)
+            new_cfg = {
+                "embedder": {"provider": "cloudflare", "model": "@cf/baai/bge-m3", "dims": 2},
+                "chunk": {"target_tokens": 900, "overlap_pct": 0.15},
+            }
+            result = kb.embed.reembed_collection_shadow(conn, row, new_cfg)
+            assert result["status"] == "done"
+            assert result["vector_index_ready"] is True
+
+            assert kb.db.vec_table_exists(conn, cid, shadow=True) is False
+            live_table = kb.db.vec_table_name(cid)
+            packed = kb.embed.serialize_vector([0.3, 0.3])
+            rows = conn.execute(
+                f"SELECT chunk_id FROM {live_table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (packed, 1),
+            ).fetchall()
+            assert len(rows) == 1
+            assert kb.db.get_collection_by_id(conn, cid)["migration_state"] == "idle"
+        finally:
+            conn.close()
+
 
 # ===========================================================================
 # ledger.py
@@ -518,6 +566,241 @@ class TestDb:
             kb.db.vec_table_name(-1)
         with pytest.raises(kb.db.DbError):
             kb.db.vec_table_name("1; DROP TABLE x")
+
+    def test_swap_vec_table_survives_rename_incompatible_vec0(self, kb):
+        """B11 regression: sqlite-vec's vec0 does not implement xRename, so
+        the old ``ALTER TABLE ... RENAME`` swap corrupted the live table.
+        Build a live table with a stale row plus a filled shadow table,
+        swap, and confirm a KNN query against the live table still works
+        and returns only the shadow's rows -- proving the DROP+CREATE+copy
+        swap actually replaced the live table's schema/contents rather than
+        leaving a renamed-but-broken vec0 table (or silently no-op'ing)."""
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "swaptest", embedder_dims=2)
+            vec_ready = kb.db.ensure_vec_table(conn, cid, 2)
+            if not vec_ready:
+                pytest.skip("sqlite-vec extension not available in this environment")
+            kb.db.ensure_vec_table(conn, cid, 2, shadow=True)
+
+            live_table = kb.db.vec_table_name(cid)
+            shadow_table = kb.db.vec_table_name(cid, shadow=True)
+
+            with conn:
+                # Stale row already in the LIVE table before migration --
+                # must NOT survive the swap.
+                conn.execute(
+                    f"INSERT INTO {live_table}(chunk_id, embedding) VALUES (?, ?)",
+                    (999, kb.embed.serialize_vector([9.0, 9.0])),
+                )
+                conn.execute(
+                    f"INSERT INTO {shadow_table}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([1.0, 0.0])),
+                )
+                conn.execute(
+                    f"INSERT INTO {shadow_table}(chunk_id, embedding) VALUES (?, ?)",
+                    (2, kb.embed.serialize_vector([0.0, 1.0])),
+                )
+
+            kb.db.swap_vec_table(conn, cid, 2)
+
+            assert kb.db.vec_table_exists(conn, cid, shadow=True) is False
+            assert kb.db.vec_table_exists(conn, cid, shadow=False) is True
+
+            packed = kb.embed.serialize_vector([1.0, 0.0])
+            rows = conn.execute(
+                f"SELECT chunk_id FROM {live_table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (packed, 2),
+            ).fetchall()
+            assert {r["chunk_id"] for r in rows} == {1, 2}
+        finally:
+            conn.close()
+
+    def test_swap_vec_table_rejects_bad_dims(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "swapbaddims", embedder_dims=2)
+            vec_ready = kb.db.ensure_vec_table(conn, cid, 2, shadow=True)
+            if not vec_ready:
+                pytest.skip("sqlite-vec extension not available in this environment")
+            with pytest.raises(kb.db.DbError):
+                kb.db.swap_vec_table(conn, cid, 0)
+            with pytest.raises(kb.db.DbError):
+                kb.db.swap_vec_table(conn, cid, "1024")
+        finally:
+            conn.close()
+
+    def test_safe_drop_vec_table_healthy(self, kb):
+        """safe_drop_vec_table removes a healthy vec0 table AND all four of
+        its companion shadow tables (the plain-DROP destructor path)."""
+        import sqlite3
+
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "healthydrop", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid, 2):
+                pytest.skip("sqlite-vec extension not available in this environment")
+            table = kb.db.vec_table_name(cid)
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {table}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([0.5, 0.5])),
+                )
+            with conn:
+                kb.db.safe_drop_vec_table(conn, table)
+            assert kb.db.vec_table_exists(conn, cid) is False
+            leftover = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE ? || '%'", (table,)
+            ).fetchall()
+            assert leftover == []
+        finally:
+            conn.close()
+
+    def test_bare_drop_fails_on_corrupt_vec0_but_safe_drop_survives(self, kb):
+        """B11 extra case -- ALREADY-corrupt live table (the state every user
+        who ran the OLD buggy reindex is left in). Simulate corruption by
+        deleting one of vec0's internal companion tables, then prove (on a
+        first collection) that a plain ``DROP TABLE`` fails, and (on a second,
+        identically corrupted collection) that ``safe_drop_vec_table`` drops
+        it cleanly, companions and all.
+
+        Two separate collections on purpose: a failed bare ``DROP TABLE``
+        leaves vec0's in-memory module state half-torn-down for THAT table, so
+        recovery must be proven on a table that was never bare-dropped
+        first -- exactly the guarantee the real reindex path needs."""
+        import sqlite3
+
+        conn = kb.db.get_connection()
+        try:
+            # --- collection A: prove the bare DROP genuinely fails ---
+            cid_a = kb.db.create_collection(conn, "corrupt_a", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid_a, 2):
+                pytest.skip("sqlite-vec extension not available in this environment")
+            table_a = kb.db.vec_table_name(cid_a)
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {table_a}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([1.0, 0.0])),
+                )
+                # Corrupt it the way the old rename bug does: the main table's
+                # companion shadow tables go missing out from under it.
+                conn.execute(f"DROP TABLE {table_a}_rowids")
+            with pytest.raises(sqlite3.Error):
+                conn.execute(f"DROP TABLE {table_a}")
+
+            # --- collection B: identical corruption, safe_drop recovers ---
+            cid_b = kb.db.create_collection(conn, "corrupt_b", embedder_dims=2)
+            kb.db.ensure_vec_table(conn, cid_b, 2)
+            table_b = kb.db.vec_table_name(cid_b)
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {table_b}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([1.0, 0.0])),
+                )
+                conn.execute(f"DROP TABLE {table_b}_rowids")
+            with conn:
+                kb.db.safe_drop_vec_table(conn, table_b)
+            assert kb.db.vec_table_exists(conn, cid_b) is False
+            leftover = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE ? || '%'", (table_b,)
+            ).fetchall()
+            assert leftover == []
+        finally:
+            conn.close()
+
+    def test_safe_drop_sweeps_mainless_orphan_companions(self, kb):
+        """A previous broken migration can leave companion shadow tables whose
+        MAIN vec0 table is already gone (e.g. orphaned ``vec_c{id}_v2_*`` after
+        the old rename swap). safe_drop_vec_table on that name sweeps the
+        stragglers even though there is no main table to run a destructor."""
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "orphan", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid, 2, shadow=True):
+                pytest.skip("sqlite-vec extension not available in this environment")
+            shadow = kb.db.vec_table_name(cid, shadow=True)
+            # Drop the main shadow vtable but leave orphaned companion tables.
+            with conn:
+                conn.execute(f"DROP TABLE {shadow}")
+                conn.execute(f'CREATE TABLE "{shadow}_chunks"(x)')
+                conn.execute(f'CREATE TABLE "{shadow}_rowids"(x)')
+            with conn:
+                kb.db.safe_drop_vec_table(conn, shadow)
+            leftover = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE ? || '%'", (shadow,)
+            ).fetchall()
+            assert leftover == []
+        finally:
+            conn.close()
+
+    def test_swap_vec_table_over_corrupt_live(self, kb):
+        """End-to-end B11-recovery: a corrupt LIVE table (companions deleted)
+        plus a filled shadow -- the exact post-buggy-reindex state -- must
+        still swap cleanly. Proves swap_vec_table's tolerant drop lets the
+        recovery reindex actually replace the broken live table, and a KNN
+        query works afterwards."""
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "corruptswap", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid, 2):
+                pytest.skip("sqlite-vec extension not available in this environment")
+            kb.db.ensure_vec_table(conn, cid, 2, shadow=True)
+            live = kb.db.vec_table_name(cid)
+            shadow = kb.db.vec_table_name(cid, shadow=True)
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {live}(chunk_id, embedding) VALUES (?, ?)",
+                    (999, kb.embed.serialize_vector([9.0, 9.0])),
+                )
+                conn.execute(
+                    f"INSERT INTO {shadow}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([1.0, 0.0])),
+                )
+                conn.execute(
+                    f"INSERT INTO {shadow}(chunk_id, embedding) VALUES (?, ?)",
+                    (2, kb.embed.serialize_vector([0.0, 1.0])),
+                )
+                # Corrupt the live table: strip a companion shadow table.
+                conn.execute(f"DROP TABLE {live}_rowids")
+
+            kb.db.swap_vec_table(conn, cid, 2)
+
+            assert kb.db.vec_table_exists(conn, cid, shadow=True) is False
+            assert kb.db.vec_table_exists(conn, cid) is True
+            packed = kb.embed.serialize_vector([1.0, 0.0])
+            rows = conn.execute(
+                f"SELECT chunk_id FROM {live} WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (packed, 2),
+            ).fetchall()
+            assert {r["chunk_id"] for r in rows} == {1, 2}
+        finally:
+            conn.close()
+
+    def test_delete_collection_over_corrupt_vec0(self, kb):
+        """delete_collection must not be wedged by a corrupt live vec table:
+        a user who ran the old buggy reindex must still be able to delete the
+        broken collection (a plain DROP of its corrupt vec table would abort
+        the whole delete transaction)."""
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "delcorrupt", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid, 2):
+                pytest.skip("sqlite-vec extension not available in this environment")
+            live = kb.db.vec_table_name(cid)
+            with conn:
+                conn.execute(
+                    f"INSERT INTO {live}(chunk_id, embedding) VALUES (?, ?)",
+                    (1, kb.embed.serialize_vector([1.0, 0.0])),
+                )
+                conn.execute(f"DROP TABLE {live}_rowids")  # corrupt it
+            kb.db.delete_collection(conn, cid)
+            assert kb.db.get_collection_by_id(conn, cid) is None
+            leftover = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE ? || '%'", (live,)
+            ).fetchall()
+            assert leftover == []
+        finally:
+            conn.close()
 
     def test_ingestion_job_lifecycle(self, kb):
         conn = kb.db.get_connection()

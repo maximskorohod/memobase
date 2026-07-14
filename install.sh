@@ -2,9 +2,12 @@
 # Installs MemoBase end-to-end: finds the hermes-agent venv, installs the
 # Python dependencies into it, copies this plugin folder into
 # <HERMES_HOME>/plugins/memobase/ (unless already running from there --
-# updates it in place instead), and enables it in config.yaml
-# (plugins.enabled). One command; nothing left to do by hand except optional
-# API keys (see the printed summary at the end).
+# updates it in place instead), enables it in config.yaml
+# (plugins.enabled), and -- if the gateway runs as a systemd --user unit --
+# wires a systemd drop-in (EnvironmentFile=<HERMES_HOME>/.env) so
+# `hermes gateway restart` actually picks up keys saved to .env (bug B12;
+# a no-op off systemd, see systemd_env.py). One command; nothing left to do
+# by hand except optional API keys (see the printed summary at the end).
 #
 # Package list (DESIGN_v1.md "install script" section) -- all MIT/BSD/
 # Apache, no torch, no pymupdf (AGPL), no docling:
@@ -299,6 +302,19 @@ PYEOF
         CONFIG_STATUS="failed"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# systemd drop-in (bug B12, "systemd .env gap"): if the gateway runs as a
+# systemd --user unit, wire an EnvironmentFile pointing at
+# <HERMES_HOME>/.env so `hermes gateway restart` actually picks up keys
+# saved by the setup wizard/CLI -- the shipped unit never reads .env on its
+# own otherwise. Runs from the COPIED destination (not $SCRIPT_DIR) so the
+# invoked systemd_env.py is always the version that just landed at
+# $DEST_DIR. Safely a no-op off systemd (systemd_env.py's own guard); the
+# `|| true` is belt-and-braces on top of that so this step can never abort
+# the install.
+# ---------------------------------------------------------------------------
+"$PYTHON" "$DEST_DIR/systemd_env.py" "$HERMES_HOME_RESOLVED" || true
 
 echo ""
 echo "============================================================"

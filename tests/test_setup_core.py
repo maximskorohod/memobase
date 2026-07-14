@@ -331,6 +331,66 @@ class TestStepSequencing:
 
 
 # ===========================================================================
+# restart_hint() -- systemd-aware restart instruction (bug B12, "systemd
+# .env gap"). Both branches are driven by mocking systemd_env's OWN
+# detect_systemd_gateway (never the real systemctl) -- see
+# tests/test_systemd_env.py for systemd_env.py's own unit coverage
+# (including wire_gateway_env, which setup_core.py never calls itself --
+# that's install.sh's job at install time, not the onboarding wizards').
+# ===========================================================================
+
+
+class TestRestartHint:
+    def _systemd_env(self, kb):
+        import importlib
+
+        # setup_core.restart_hint() imports systemd_env lazily
+        # (function-local, `from . import systemd_env`) -- fetch the SAME
+        # module object under kb's synthetic package name so monkeypatching
+        # its detect_systemd_gateway here actually reaches restart_hint().
+        return importlib.import_module(f"{kb.__name__}.systemd_env")
+
+    def test_mentions_gateway_restart_when_under_systemd(self, kb, monkeypatch):
+        systemd_env = self._systemd_env(kb)
+        monkeypatch.setattr(systemd_env, "detect_systemd_gateway", lambda **kwargs: True)
+        hint = kb.setup_core.restart_hint()
+        assert "hermes gateway restart" in hint
+        assert "systemd" in hint.lower()
+
+    def test_mentions_plain_restart_when_not_under_systemd(self, kb, monkeypatch):
+        systemd_env = self._systemd_env(kb)
+        monkeypatch.setattr(systemd_env, "detect_systemd_gateway", lambda **kwargs: False)
+        hint = kb.setup_core.restart_hint()
+        assert hint == "Перезапустите hermes, чтобы подхватить ключи из .env."
+
+    def test_never_raises_if_detection_itself_blows_up(self, kb, monkeypatch):
+        systemd_env = self._systemd_env(kb)
+
+        def boom(**kwargs):
+            raise RuntimeError("systemctl exploded")
+
+        monkeypatch.setattr(systemd_env, "detect_systemd_gateway", boom)
+        hint = kb.setup_core.restart_hint()  # must not raise
+        assert hint == "Перезапустите hermes, чтобы подхватить ключи из .env."
+
+    def test_done_message_includes_hint_and_keeps_required_substrings_under_systemd(self, kb, monkeypatch):
+        systemd_env = self._systemd_env(kb)
+        monkeypatch.setattr(systemd_env, "detect_systemd_gateway", lambda **kwargs: True)
+        done = kb.setup_core.done_message()
+        assert "hermes gateway restart" in done
+        low = done.lower()
+        assert "заверш" in low and "шпаргалка" in low and "статус" in low
+
+    def test_done_message_includes_hint_and_keeps_required_substrings_off_systemd(self, kb, monkeypatch):
+        systemd_env = self._systemd_env(kb)
+        monkeypatch.setattr(systemd_env, "detect_systemd_gateway", lambda **kwargs: False)
+        done = kb.setup_core.done_message()
+        assert "Перезапустите hermes, чтобы подхватить ключи из .env." in done
+        low = done.lower()
+        assert "заверш" in low and "шпаргалка" in low and "статус" in low
+
+
+# ===========================================================================
 # Live provider probe -- never a real network call in this suite
 # ===========================================================================
 
