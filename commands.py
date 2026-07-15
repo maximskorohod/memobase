@@ -19,6 +19,9 @@ since a slash command has no session-binding concept of its own (binding is
 a delegated-subagent isolation mechanism, see ``tools.py``'s module
 docstring — a top-level chat session invoking ``/memobase`` is always
 "unbound"/privileged).
+
+ВАЖНО: новые slash-подкоманды подхватываются gateway только после «hermes
+gateway restart» — до рестарта работает CLI-путь (hermes memobase ...).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ HELP_TEXT = (
     "/memobase <вопрос> — спросить базу знаний (коллекция по умолчанию)\n"
     "/memobase status [коллекция] — статус базы знаний\n"
     "/memobase list — список коллекций\n"
+    "/memobase list-documents [коллекция] — документы внутри коллекции (заголовок, источник, число фрагментов)\n"
     "/memobase ingest <источник> <тип> [коллекция] — загрузить файл/URL\n"
     "/memobase selfcheck <коллекция> — проверить качество индексации\n"
     "/memobase delete <коллекция> — удалить коллекцию целиком\n"
@@ -39,6 +43,9 @@ HELP_TEXT = (
     "/memobase share <коллекция> <user_id> [read|write] — выдать доступ (владелец)\n"
     "/memobase share-revoke <коллекция> <user_id> — отозвать доступ (владелец)\n"
     "/memobase quarantine [коллекция] — очередь гостевых загрузок на проверку (владелец)\n"
+    "/memobase youtube-list <канал> [сколько] — свежие видео канала (владелец)\n"
+    "/memobase youtube-transcript <видео> — таймкод-транскрипт по субтитрам (владелец)\n"
+    "/memobase youtube-audio <видео> — аудио+STT для видео без субтитров, платно (владелец)\n"
     "/memobase setup — мастер настройки (в Telegram — по одному сообщению за раз; в CLI см. `hermes memobase setup`)\n"
     "/memobase help — эта справка"
 )
@@ -64,6 +71,10 @@ def handle_kb_command(raw_args: str) -> Optional[str]:
 
     if sub == "list":
         return tools.memobase_list({}, session_id=None)
+
+    if sub == "list-documents":
+        args = {"collection": rest} if rest else {}
+        return tools.memobase_list_documents(args, session_id=None)
 
     if sub == "ingest":
         parts = rest.split()
@@ -115,6 +126,28 @@ def handle_kb_command(raw_args: str) -> Optional[str]:
     if sub == "quarantine":
         args = {"collection": rest} if rest else {}
         return tools.memobase_quarantine_list(args, session_id=None)
+
+    if sub == "youtube-list":
+        parts = rest.split()
+        if not parts:
+            return "Использование: /memobase youtube-list <канал> [сколько]"
+        args = {"channel": parts[0]}
+        if len(parts) > 1:
+            try:
+                args["limit"] = int(parts[1])
+            except ValueError:
+                return f"«{parts[1]}» — не число (второй параметр — сколько видео вернуть)."
+        return tools.memobase_youtube_list_channel(args, session_id=None)
+
+    if sub == "youtube-transcript":
+        if not rest:
+            return "Использование: /memobase youtube-transcript <видео>"
+        return tools.memobase_youtube_get_transcript({"video": rest}, session_id=None)
+
+    if sub == "youtube-audio":
+        if not rest:
+            return "Использование: /memobase youtube-audio <видео>"
+        return tools.memobase_youtube_dl_audio({"video": rest}, session_id=None)
 
     if sub == "setup":
         return (

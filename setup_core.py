@@ -216,6 +216,140 @@ def write_env_secret(env_var: str, value: str) -> None:
     os.environ[env_var] = value  # make it visible to THIS process immediately, for the live-validate step
 
 
+# ---------------------------------------------------------------------------
+# Key visibility (read side) — a safe, network-free counterpart to
+# write_env_secret. Lets `/memobase status` and the onboarding UIs SHOW
+# "what is configured, where the .env lives, and is the running process
+# actually seeing it" so a human never has to hand-open the file. A full
+# secret is NEVER returned — only mask_secret()'s first-4-chars form.
+# ---------------------------------------------------------------------------
+
+# Same line grammar the wizard's upsert respects: optional indent, optional
+# ``#``/``# `` comment prefix, KEY, ``=``, value. A commented-out or
+# empty-valued line does NOT count as "configured".
+_ENV_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<hash>#+\s*)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=(?P<rest>.*)$"
+)
+
+
+def env_file_path() -> Path:
+    """Public accessor for ``<HERMES_HOME>/.env`` — the single file where this
+    plugin's keys are written and read. Surfaced so status/onboarding can SHOW
+    the path instead of making a human hunt for it."""
+    return _env_path()
+
+
+def _read_env_file_values() -> Dict[str, str]:
+    """``{KEY: value}`` for every ACTIVE (uncommented, non-empty) line in
+    ``<HERMES_HOME>/.env``. Reads the file once; never raises (a missing or
+    unreadable file yields ``{}``). In-memory only — the read counterpart to
+    :func:`write_env_secret`."""
+    path = _env_path()
+    result: Dict[str, str] = {}
+    try:
+        if not path.exists():
+            return result
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return result
+    for line in text.splitlines():
+        m = _ENV_LINE_RE.match(line)
+        if not m or m.group("hash"):
+            continue
+        val = m.group("rest").strip()
+        if val:
+            result[m.group("key")] = val
+    return result
+
+
+def key_status(env_vars: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Read-only status of each var in *env_vars*, for status/onboarding UIs.
+
+    Returns ``{VAR: {"in_file": bool, "in_process": bool, "mask": str}}``:
+
+    * ``in_file``    — an active, non-empty ``VAR=...`` exists in ``.env``.
+    * ``in_process`` — ``os.environ[VAR]`` is set & non-empty — what the RUNNING
+      hermes actually sees. Present in the file but NOT here means the gateway
+      started before the key was added and needs a restart (bug B12).
+    * ``mask``       — :func:`mask_secret` of the value (process value preferred,
+      else file value), or ``""`` when set nowhere. NEVER the full value.
+
+    Never raises; never surfaces a full secret.
+    """
+    file_vals = _read_env_file_values()
+    out: Dict[str, Dict[str, Any]] = {}
+    for var in env_vars:
+        file_val = file_vals.get(var)
+        proc_raw = os.environ.get(var)
+        proc_val = proc_raw if (proc_raw and proc_raw.strip()) else None
+        shown = proc_val or file_val
+        out[var] = {
+            "in_file": bool(file_val),
+            "in_process": bool(proc_val),
+            "mask": mask_secret(shown) if shown else "",
+        }
+    return out
+
+
+def relevant_keys(memobase_cfg: Dict[str, Any], *, include_youtube: bool = True) -> List[Dict[str, Any]]:
+    """Ordered catalog of the ``.env`` keys THIS install actually uses, derived
+    from effective config, for the status "Ключи" block. Each item is
+    ``{"env_var", "role", "required"}`` — ``role`` a short RU label, ``required``
+    True when search/memory is broken without it (vs an optional extra).
+
+    Embedder keys follow ``embedder.provider`` (local needs none); rerank adds
+    COHERE when enabled; YouTube/STT keys are optional operator extras."""
+    embedder = (memobase_cfg.get("embedder") or {}).get("provider") or "cloudflare"
+    rerank = memobase_cfg.get("rerank") or {}
+    items: List[Dict[str, Any]] = []
+
+    if embedder == "cloudflare":
+        items.append({"env_var": "CLOUDFLARE_ACCOUNT_ID", "role": "эмбеддер (Cloudflare)", "required": True})
+        items.append({"env_var": "CLOUDFLARE_API_TOKEN", "role": "эмбеддер (Cloudflare)", "required": True})
+    elif embedder == "cohere":
+        items.append({"env_var": "COHERE_API_KEY", "role": "эмбеддер (Cohere)", "required": True})
+    elif embedder in ("openai", "openai-compat"):
+        items.append({"env_var": "OPENAI_API_KEY", "role": "эмбеддер (OpenAI-совм.)", "required": True})
+    # local embedder: no keys needed.
+
+    if rerank.get("enabled", True) and rerank.get("provider", "cohere") == "cohere":
+        if not any(i["env_var"] == "COHERE_API_KEY" for i in items):
+            items.append({"env_var": "COHERE_API_KEY", "role": "реранк (Cohere)", "required": False})
+
+    if include_youtube:
+        items.append({"env_var": "SCRAPECREATORS_API_KEY", "role": "YouTube-субтитры", "required": False})
+        items.append({"env_var": "APIFY_TOKEN", "role": "YouTube-аудио (запас)", "required": False})
+        items.append({"env_var": "GROQ_API_KEY", "role": "распознавание речи", "required": False})
+        items.append({"env_var": "GEMINI_API_KEY", "role": "распознавание речи (запас)", "required": False})
+
+    return items
+
+
+def format_keys_block(memobase_cfg: Dict[str, Any], *, include_youtube: bool = True) -> str:
+    """Render the read-only "Ключи" section for `/memobase status`: the ``.env``
+    path plus one line per relevant key — ``✓ настроен`` / ``✗ нет`` / ``⚠`` when
+    it is in the file but the running process has not picked it up yet. Never
+    prints a full secret; never makes a network call."""
+    catalog = relevant_keys(memobase_cfg, include_youtube=include_youtube)
+    statuses = key_status([c["env_var"] for c in catalog])
+    lines = [f"Ключи (.env: {env_file_path()}):"]
+    stale = False
+    for c in catalog:
+        var = c["env_var"]
+        st = statuses.get(var, {})
+        role = f"[{c['role']}{'' if c['required'] else ', опц.'}]"
+        if st.get("in_process"):
+            lines.append(f"  {var} — ✓ настроен ({st['mask']}) {role}")
+        elif st.get("in_file"):
+            stale = True
+            lines.append(f"  {var} — ⚠ есть в .env ({st['mask']}), но процесс не видит {role}")
+        else:
+            lines.append(f"  {var} — ✗ нет {role}")
+    if stale:
+        lines.append(f"  ⚠ Часть ключей записана, но не подхвачена процессом: {restart_hint()}")
+    return "\n".join(lines)
+
+
 def validate_provider_key(provider: str) -> Tuple[bool, str]:
     """Live-validate a just-entered provider key with the smallest possible
     real call. Never raises — returns ``(False, <message>)`` on any
@@ -512,7 +646,8 @@ def restart_hint() -> str:
 
 def done_message() -> str:
     base = "Настройка завершена. Шпаргалка: спросить — просто вопросом; добавить — «добавь в базу ...»; статус — /memobase status."
-    return f"{base} {restart_hint()}"
+    where = f"Ключи записаны в {env_file_path()}."
+    return f"{base} {where} {restart_hint()}"
 
 
 def local_embedder_model() -> str:

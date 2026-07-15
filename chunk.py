@@ -33,9 +33,14 @@ Algorithm (deliberately simple, stdlib-only, no ML model):
    boundary. The highest-scoring boundary seen in the window is where the
    chunk is actually cut.
 
-3. A single unit that alone exceeds the upper bound (e.g. a huge code
-   block) is never split — it becomes its own chunk regardless of size,
-   because atomicity is a harder constraint than the token target.
+3. A single ATOMIC unit (code fence / table row) that alone exceeds the
+   upper bound is never split — it becomes its own chunk regardless of
+   size, because atomicity is a harder constraint than the token target.
+   Oversized PROSE, however, IS force-split (single-newline seams first,
+   then a hard character slice) once a paragraph exceeds
+   ``max(FORCE_SPLIT_MIN_TOKENS, target_tokens * UPPER_MULT)`` — a blob
+   with no blank lines (e.g. an ASR transcript joined with single \n)
+   must not become one giant chunk (v2, see CHUNKER_VERSION).
 
 4. Overlap: the tail of each committed chunk (up to
    ``overlap_pct * target_tokens`` tokens, counted in whole units) is
@@ -82,6 +87,20 @@ def approx_tokens(text: str) -> int:
     return max(1, round(len(text) / CHARS_PER_TOKEN_APPROX))
 
 
+# Version salt for ingest.py's document content-hash: bump on ANY change to
+# the chunking algorithm, so re-ingesting an unchanged source is no longer
+# short-circuited as "unchanged" and gets re-chunked with the new algorithm
+# (ingest.py's per-chunk hash dedup keeps the re-embed cost limited to
+# chunks whose text actually changed).
+CHUNKER_VERSION = "2"
+
+# Absolute floor (approx tokens) below which a prose paragraph is never
+# force-split regardless of target_tokens. Protects micro-configs: tests and
+# tiny collections set chunk_target_tokens=5, and their perfectly normal
+# 7-17-token paragraphs must not be shredded into character slices.
+FORCE_SPLIT_MIN_TOKENS = 256
+
+
 # ---------------------------------------------------------------------------
 # Heading / paragraph detection
 # ---------------------------------------------------------------------------
@@ -113,13 +132,45 @@ def _split_paragraphs(text: str) -> List[str]:
     return [p.strip() for p in _PARA_SPLIT_RE.split(text) if p.strip()]
 
 
+def _force_split_oversized(text: str, limit_tokens: int) -> List[str]:
+    """Split an oversized PROSE paragraph (no blank lines inside — otherwise
+    ``_split_paragraphs`` would already have cut it) into pieces each within
+    *limit_tokens*. Single-``\\n`` lines are the primary seam (the natural
+    shape of ASR transcripts / line-oriented exports); a single line still
+    over the limit is hard-sliced by character budget, preferring the last
+    space left of the cut. No intra-piece overlap — chunk()'s window overlap
+    already provides continuity across chunks."""
+    budget_chars = max(1, int(limit_tokens * CHARS_PER_TOKEN_APPROX))
+    pieces: List[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if approx_tokens(line) <= limit_tokens:
+            pieces.append(line)
+            continue
+        rest = line
+        while approx_tokens(rest) > limit_tokens:
+            cut = rest.rfind(" ", 1, budget_chars + 1)
+            if cut <= 0:
+                cut = budget_chars
+            piece = rest[:cut].strip()
+            if piece:
+                pieces.append(piece)
+            rest = rest[cut:].strip()
+        if rest:
+            pieces.append(rest)
+    return pieces or [text]
+
+
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
 
 
-def _build_units(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_units(blocks: List[Dict[str, Any]], target_tokens: int) -> List[Dict[str, Any]]:
     units: List[Dict[str, Any]] = []
+    force_limit = max(FORCE_SPLIT_MIN_TOKENS, int(round(target_tokens * UPPER_MULT)))
     for block in blocks:
         text = block.get("text") or ""
         if not text.strip():
@@ -146,18 +197,28 @@ def _build_units(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         for para in _split_paragraphs(text):
-            units.append(
-                {
-                    "text": para,
-                    "tokens": approx_tokens(para),
-                    "page": page,
-                    "section": section,
-                    "is_code": False,
-                    "is_table_row": False,
-                    "table_header": None,
-                    "is_heading": _is_heading(para),
-                }
+            # Force-split oversized PROSE (v2): a blob with no blank lines
+            # (e.g. an ASR transcript joined with single \n) must not become
+            # one giant unit -> one giant chunk. Atomicity remains guaranteed
+            # only for code fences / table rows above.
+            pieces = (
+                _force_split_oversized(para, force_limit)
+                if approx_tokens(para) > force_limit
+                else [para]
             )
+            for piece in pieces:
+                units.append(
+                    {
+                        "text": piece,
+                        "tokens": approx_tokens(piece),
+                        "page": page,
+                        "section": section,
+                        "is_code": False,
+                        "is_table_row": False,
+                        "table_header": None,
+                        "is_heading": _is_heading(piece),
+                    }
+                )
     return units
 
 
@@ -224,7 +285,7 @@ def chunk(doc: Dict[str, Any], target_tokens: int, overlap_pct: float) -> List[D
     if not blocks and doc.get("text"):
         blocks = [{"text": doc["text"], "page": None, "section": None, "is_code": False}]
 
-    units = _build_units(blocks)
+    units = _build_units(blocks, target_tokens)
     if not units:
         return []
 

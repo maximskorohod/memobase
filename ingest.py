@@ -75,10 +75,19 @@ def _sha256(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _extract_dispatch(source: str, source_type: str, *, memobase_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_dispatch(
+    source: str, source_type: str, *, memobase_cfg: Dict[str, Any], meta_hint: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """*meta_hint* is an OPTIONAL caller-supplied metadata hint (currently
+    only a ``"title"`` key is read anywhere) for source types whose extractor
+    can use a piece of metadata the caller already has instead of a worse
+    fallback (``youtube.extract_video`` falling back to the bare video id
+    when it doesn't know the title). Every other source_type ignores it —
+    kept optional/None-default so their extractors' signatures
+    (pdf/obsidian/audio/...) are untouched."""
     normalized = (source_type or "").strip().lower()
     if normalized == "youtube":
-        return youtube_mod.extract_video(source, memobase_cfg=memobase_cfg)
+        return youtube_mod.extract_video(source, memobase_cfg=memobase_cfg, meta_hint=meta_hint)
     if normalized in ("audio", "video"):
         return stt_mod.extract_media(source, source_type=normalized, memobase_cfg=memobase_cfg)
     if normalized == "obsidian":
@@ -207,10 +216,17 @@ def ingest_source(
     confirm: bool = False,
     llm: Optional[Any] = None,
     uploader_user_id: Optional[str] = None,
+    meta_hint: Optional[Dict[str, Any]] = None,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Ingest *source* (a file path or, for ``source_type == "url"``, a
     URL) into the collection described by *collection_row* (a DB row dict
     from ``db.get_collection_by_id``/``by_name``).
+
+    *meta_hint*: see :func:`_extract_dispatch` — an optional metadata hint
+    forwarded to the extractor (currently only used by ``source_type ==
+    "youtube"``). ``None`` (the default) is a no-op for every source_type,
+    including youtube (falls back to its own id/title logic).
 
     *llm* is an OPTIONAL ``ctx.llm``-shaped handle, used ONLY for JIT
     contextual enrichment (enrich.py) when ``memobase.enrich.enabled`` is
@@ -228,12 +244,35 @@ def ingest_source(
     normal behavior, unchanged from v1. Also attributes any embed spend
     recorded during this call to this user_id (ledger, §1.9 gap #8).
 
+    *force*: bypass the content-hash "unchanged" short-circuit below and
+    re-run normalize/chunk/embed even when the document's overall text is
+    byte-identical to what's already indexed. Does NOT duplicate the
+    ``CHUNKER_VERSION`` salt already baked into ``content_hash`` (step 1
+    below) — that salt exists so a chunker upgrade auto-invalidates every
+    "unchanged" verdict on its own; ``force`` is the MANUAL escape hatch for
+    every other reason a caller might want a clean re-run (troubleshooting,
+    or a collection-level ``chunk_target_tokens``/``overlap_pct`` change,
+    which the document-level content hash cannot see on its own). The
+    per-CHUNK content-hash dedup at step 5 still applies regardless — chunk
+    text that genuinely didn't change is still reused, never re-embedded, so
+    ``force`` never pays to re-embed something that didn't actually change.
+    Never bypasses the guest quota/budget gates elsewhere in this function
+    (those are independent checks, unaffected by this flag) — a guest
+    forcing a re-ingest of a document they're already over-budget for is
+    still refused exactly like a normal ingest.
+
     Returns a plain result dict, always with a ``status`` key, one of:
     ``"done"``, ``"unchanged"`` (content-hash identical to what's already
     indexed — nothing re-processed), ``"needs_confirmation"`` (chunk count
     over ``memobase.confirm_over_chunks``; re-call with ``confirm=True`` to
     proceed), ``"quarantined"`` (every chunk was blocked by the secret
-    scanner), or ``"failed"`` (with an ``"error"`` message).
+    scanner), or ``"failed"`` (with an ``"error"`` message). A ``"done"``
+    result additionally carries best-effort observability extras (never an
+    extra network/paid call, just data already computed along the way):
+    ``transcript_provider`` (youtube/STT source only, else ``None``),
+    ``stt_chunk_count``/``stt_duration_s`` (audio/video STT source only,
+    else ``None``), and ``cost_estimate_usd`` (this call's own actual embed
+    spend, ``0.0`` if nothing new was embedded).
 
     Never raises for ordinary failure modes — only :class:`IngestError` for
     a malformed *collection_row* (missing ``id``/``name``), which indicates
@@ -261,12 +300,16 @@ def ingest_source(
         )
 
     # --- 1. Extract --------------------------------------------------------
-    doc = _extract_dispatch(source, source_type, memobase_cfg=memobase_cfg)
+    doc = _extract_dispatch(source, source_type, memobase_cfg=memobase_cfg, meta_hint=meta_hint)
     if not (doc.get("text") or "").strip():
         reasons = "; ".join(s.get("reason", "?") for s in doc.get("skipped", [])) or "no text extracted"
         return _fail(f"extraction produced no text: {reasons}", skipped=doc.get("skipped", []))
 
-    content_hash = _sha256(doc["text"])
+    # CHUNKER_VERSION salt: a chunking-algorithm upgrade must invalidate the
+    # "unchanged" short-circuit below, otherwise already-ingested documents
+    # would never get re-chunked (per-chunk hash dedup further down keeps the
+    # re-embed cost limited to chunks whose text actually changed).
+    content_hash = _sha256(doc["text"] + "|chunker:" + chunk_mod.CHUNKER_VERSION)
 
     existing_row = conn.execute(
         "SELECT * FROM documents WHERE collection_id = ? AND source_uri = ?",
@@ -274,7 +317,7 @@ def ingest_source(
     ).fetchone()
     existing_doc = dict(existing_row) if existing_row is not None else None
 
-    if existing_doc is not None and existing_doc.get("content_sha256") == content_hash:
+    if not force and existing_doc is not None and existing_doc.get("content_sha256") == content_hash:
         db.update_ingestion_job(conn, job_id, status="done", stage="unchanged", items_total=0, items_done=0)
         return {
             "status": "unchanged",
@@ -574,6 +617,20 @@ def ingest_source(
         "chunks_quarantined_injection": guest_quarantined_count,
         "quarantine": quarantine_report,
         "vector_index_ready": vec_ready,
+        # Observability extras (best-effort, read from data this call already
+        # computed/paid for -- never a new network/paid call). `meta` (step 8
+        # above) carries transcript_provider (youtube.py's build_video_doc)
+        # or stt_provider (stt.py's extract_media) -- different key names at
+        # the source because they're different extractors, unified here
+        # under one name for the caller. Renamed to stt_chunk_count/
+        # stt_duration_s (not chunk_count/duration_s, stt.py's own internal
+        # names) specifically to avoid colliding with this SAME dict's
+        # chunks_added/chunks_reused/... family above, which count TEXT
+        # chunks -- a wholly different thing from audio chunks.
+        "transcript_provider": meta.get("transcript_provider") or meta.get("stt_provider"),
+        "stt_chunk_count": meta.get("chunk_count"),
+        "stt_duration_s": meta.get("duration_s"),
+        "cost_estimate_usd": round(actual_embed_cost_usd, 6),
     }
 
 

@@ -49,6 +49,7 @@ from . import db
 from . import ingest as ingest_mod
 from . import security
 from . import selfcheck as selfcheck_mod
+from . import setup_core
 
 logger = logging.getLogger("memobase.tools")
 
@@ -366,6 +367,16 @@ MEMOBASE_INGEST_SCHEMA: Dict[str, Any] = {
                 "type": "boolean",
                 "description": "Подтвердить загрузку, если новых фрагментов больше порога подтверждения.",
             },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "Перезагрузить источник заново, даже если он не изменился с прошлой загрузки "
+                    "(обходит дедуп по хэшу содержимого целого документа). Уже проиндексированные "
+                    "неизменившиеся фрагменты всё равно не переэмбеддятся — платно только то, что "
+                    "реально новое. По умолчанию false. Не действует при загрузке целого "
+                    "YouTube-канала/Obsidian-vault'а — только для одиночного источника."
+                ),
+            },
         },
         "required": ["source", "source_type"],
     },
@@ -378,15 +389,50 @@ def _format_multi_item_result(result: Dict[str, Any], *, name: str, kind: str) -
     similarly-shaped result dict (see their docstrings)."""
     status = result.get("status")
     if status == "needs_confirmation":
-        return f"{result.get('message', 'Нужно подтверждение.')} Повторите запрос с confirm=true, чтобы продолжить."
+        lines = [f"{result.get('message', 'Нужно подтверждение.')} Повторите запрос с confirm=true, чтобы продолжить."]
+        preview = result.get("videos_preview") or []
+        if preview:
+            lines.append("Первые видео:")
+            for i, v in enumerate(preview, start=1):
+                lines.append(
+                    f"  {i}. {v.get('video_id')} | {v.get('published_at') or '?'} | {v.get('title') or '(без названия)'}"
+                )
+            more = int(result.get("video_count") or 0) - len(preview)
+            if more > 0:
+                lines.append(f"  … и ещё {more}.")
+        return "\n".join(lines)
     if status == "failed":
         return f"Загрузка {kind} не удалась: {result.get('error', 'неизвестная ошибка')}"
     if kind == "канала":
-        return (
+        summary = (
             f"Канал загружен в коллекцию «{name}»: видео всего {result.get('video_count', 0)}, "
             f"загружено {result.get('videos_done', 0)}, без изменений {result.get('videos_unchanged', 0)}, "
-            f"не удалось {result.get('videos_failed', 0)} (источник списка: {result.get('list_provider', '?')})."
+            f"не удалось {result.get('videos_failed', 0)} (источник списка: {result.get('list_provider', '?')})"
         )
+        # Sum of the per-video cost_estimate_usd figures below -- already
+        # computed, nothing extra queried here.
+        if result.get("total_cost_estimate_usd"):
+            summary += f", оценка стоимости ${result['total_cost_estimate_usd']:.4f}"
+        lines = [summary + "."]
+        per_video = result.get("per_video") or []
+        if per_video:
+            failed_first = sorted(per_video, key=lambda r: 0 if r.get("status") == "failed" else 1)
+            shown = failed_first[:10]
+            for r in shown:
+                line = f"  {r.get('video_id')} | {r.get('status')} | {r.get('title') or '(без названия)'}"
+                if r.get("status") == "failed" and r.get("reason"):
+                    # Show WHY this video failed (e.g. an HTTP 402 "no
+                    # credits" provider response) -- capped like the STT
+                    # error messages, a provider body can run long.
+                    line += f" — {str(r['reason'])[:200]}"
+                elif r.get("transcript_provider"):
+                    # Brief, only for a video that actually succeeded (a
+                    # failed one already shows its reason above instead).
+                    line += f" [{r['transcript_provider']}]"
+                lines.append(line)
+            if len(per_video) > len(shown):
+                lines.append(f"  … и ещё {len(per_video) - len(shown)}.")
+        return "\n".join(lines)
     return (
         f"Vault загружен в коллекцию «{name}»: заметок всего {result.get('notes_total', 0)}, "
         f"загружено {result.get('notes_ingested', 0)}, без изменений {result.get('notes_unchanged', 0)}, "
@@ -463,6 +509,7 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
     if not source or not source_type:
         return "Нужны оба параметра: source и source_type."
     confirm = bool(args.get("confirm", False))
+    force = bool(args.get("force", False))
     normalized_type = (source_type or "").strip().lower()
 
     conn = db.get_connection()
@@ -503,6 +550,12 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
         # youtube.ingest_channel/obsidian.ingest_vault -> their internal
         # ingest_source() calls is a mechanical follow-up (thread one kwarg
         # through each) left for a future round.
+        #
+        # `force` has the same limitation: only the direct `ingest_source`
+        # call below honors it today -- a channel/vault source_type ignores
+        # the flag entirely (each item still dedups normally against its own
+        # previous ingest). Folding it into the two orchestrators is the
+        # same kind of mechanical follow-up as `uploader_user_id` above.
         if normalized_type == "youtube":
             from . import youtube as youtube_mod
 
@@ -524,7 +577,7 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
 
         result = ingest_mod.ingest_source(
             conn, collection_row, source, source_type, memobase_cfg=memobase_cfg, confirm=confirm, llm=_get_llm(),
-            uploader_user_id=uploader_user_id,
+            uploader_user_id=uploader_user_id, force=force,
         )
     except ingest_mod.IngestError as exc:
         return f"Ошибка загрузки: {exc}"
@@ -549,6 +602,26 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
             )
         if not result.get("vector_index_ready", True):
             parts.append("Векторный индекс недоступен (sqlite-vec не установлен) — работает только текстовый поиск.")
+        # Which transcript source actually won (youtube/STT ingest only).
+        if result.get("transcript_provider"):
+            parts.append(f"Транскрипт: {result['transcript_provider']}.")
+        # STT audio-chunking stats (audio/video source_type only).
+        if result.get("stt_chunk_count") is not None:
+            from . import youtube as youtube_mod
+
+            duration_s = result.get("stt_duration_s")
+            if duration_s is not None:
+                parts.append(
+                    f"Расшифровано аудио: {result['stt_chunk_count']} чанк(ов), "
+                    f"{youtube_mod.format_hms(duration_s)}."
+                )
+            else:
+                parts.append(f"Расшифровано аудио: {result['stt_chunk_count']} чанк(ов).")
+        # Reuses the embed cost ingest_source already computed for its own
+        # ledger write -- no extra query, $0.00 (falsy) means nothing new was
+        # embedded and is silently omitted rather than printed as noise.
+        if result.get("cost_estimate_usd"):
+            parts.append(f"Оценка стоимости: ${result['cost_estimate_usd']:.4f}.")
         return " ".join(parts)
     if status == "unchanged":
         return f"Источник не изменился с прошлой загрузки в коллекцию «{name}» — ничего не сделано."
@@ -621,15 +694,24 @@ def memobase_query(args: Dict[str, Any], **kwargs: Any) -> str:
         return f"В коллекции «{name}» ничего не найдено по запросу."
 
     blocks = []
+    from . import chunk as chunk_mod
+
+    chunk_target = int(((collection_cfg.get("chunk") or {}).get("target_tokens")) or 900)
     for c in candidates:
         header = f"[chunk:{c['chunk_id']}] score={c['score']:.4f} source={c['source']} mode={c['mode']}"
         if c.get("source_uri"):
             header += f" | {c['source_uri']}"
         if c.get("page_or_timecode"):
             header += f" стр./время: {c['page_or_timecode']}"
-        # Blocker #2: memobase_query feeds a PRIVILEGED
-        # caller (unlike memobase_ask's isolated tool-less LLM) — every chunk MUST
-        # be fenced + injection-scanned here, not just at ingest time.
+        tok = chunk_mod.approx_tokens(c["text"])
+        if tok > 2 * chunk_target:
+            header += (
+                f" ⚠ крупный фрагмент ~{tok} ток. при цели {chunk_target} — "
+                f"скор может быть завышен; перезалейте документ (обновлённый чанкер)"
+            )
+        # memobase_query feeds a PRIVILEGED caller (unlike memobase_ask's
+        # isolated tool-less LLM) — every chunk MUST be fenced +
+        # injection-scanned here, not just at ingest time.
         blocks.append(header + "\n" + security.fence_untrusted(c["text"], source=str(c.get("source_uri") or "memobase")))
     return "\n\n".join(blocks)
 
@@ -828,6 +910,17 @@ MEMOBASE_STATUS_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _keys_status_block(memobase_cfg: Dict[str, Any], privileged: bool) -> str:
+    """The read-only 'Ключи' block for status output (path + per-key ✓/✗/⚠).
+    Never breaks status: any failure degrades to an empty string. YouTube/STT
+    keys are shown only to the privileged operator (a guest can't use them)."""
+    try:
+        return setup_core.format_keys_block(memobase_cfg, include_youtube=privileged)
+    except Exception:
+        logger.debug("memobase_status: keys block render failed", exc_info=True)
+        return ""
+
+
 def memobase_status(args: Dict[str, Any], **kwargs: Any) -> str:
     session_id = kwargs.get("session_id")
     bound = get_session_binding(session_id)
@@ -858,7 +951,9 @@ def memobase_status(args: Dict[str, Any], **kwargs: Any) -> str:
             rows = list(by_id.values())
 
         if not rows:
-            return f"Коллекция «{requested}» не найдена." if requested else "Коллекций пока нет."
+            head = f"Коллекция «{requested}» не найдена." if requested else "Коллекций пока нет."
+            block = _keys_status_block(memobase_cfg, privileged)
+            return f"{head}\n\n{block}" if block else head
 
         for r in rows:
             jobs = db.pending_ingestion_jobs(conn, collection_id=r["id"])
@@ -868,6 +963,13 @@ def memobase_status(args: Dict[str, Any], **kwargs: Any) -> str:
             )
             for j in jobs[:5]:
                 lines.append(f"    задача #{j['id']}: этап {j['stage']}, статус {j['status']}, {j['items_done']}/{j['items_total']}")
+            if requested:
+                top_docs = db.top_documents_by_chunks(conn, r["id"], limit=5)
+                if top_docs:
+                    lines.append("    Топ документов по объёму:")
+                    for d_row in top_docs:
+                        label = d_row.get("title") or d_row.get("source_uri") or f"doc#{d_row.get('document_id')}"
+                        lines.append(f"      {label} — {d_row['live_chunks']} фрагм.")
             if privileged:
                 # Owner sees everything about their guests' collections
                 # (§1.4: "/memobase status показывает гостевые коллекции, объёмы,
@@ -887,7 +989,94 @@ def memobase_status(args: Dict[str, Any], **kwargs: Any) -> str:
                 lines.append(f"Расход за 30 дней ({provider}): ${spent:.4f} из ${float(ceiling):.2f}")
     finally:
         conn.close()
+    block = _keys_status_block(memobase_cfg, privileged)
+    if block:
+        lines.append("")
+        lines.append(block)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# memobase_list_documents
+# ---------------------------------------------------------------------------
+
+MEMOBASE_LIST_DOCUMENTS_SCHEMA: Dict[str, Any] = {
+    "name": "memobase_list_documents",
+    "description": (
+        "Показать документы внутри коллекции базы знаний: заголовок, источник, число живых фрагментов — "
+        "чтобы видеть содержимое коллекции без похода в sqlite напрямую."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string", "description": "Имя коллекции (по умолчанию — привязанная к сессии или все видимые)."},
+            "limit": {"type": "integer", "description": "Максимум документов на коллекцию (по умолчанию 50)."},
+        },
+    },
+}
+
+
+def memobase_list_documents(args: Dict[str, Any], **kwargs: Any) -> str:
+    session_id = kwargs.get("session_id")
+    bound = get_session_binding(session_id)
+    requested = args.get("collection") or bound
+
+    memobase_cfg = kb_config.get_memobase_config_readonly()
+    user_id = get_session_user(session_id)
+    privileged = security.is_privileged(user_id, memobase_cfg)
+    limit = int(args.get("limit") or 50)
+
+    conn = db.get_connection()
+    try:
+        # Same MULTIUSER gate + collection resolution as memobase_status
+        # (see its comments above): an explicit/bound collection resolves to
+        # exactly that row (or "not found" for a guest with no permission on
+        # it); with nothing resolved, every collection the caller can see.
+        if requested:
+            rows = [db.get_collection_by_name(conn, requested)]
+            rows = [r for r in rows if r]
+            if rows and not privileged and db.resolve_permission(conn, rows[0], user_id) is None:
+                rows = []  # MULTIUSER default-deny: same "not found" framing as _authorize_collection
+        elif privileged:
+            rows = db.list_collections(conn)
+        else:
+            owned = db.list_collections(conn, owner_user_id=user_id)
+            shared_ids = {s["collection_id"] for s in db.list_shares_for_user(conn, user_id)}
+            by_id = {r["id"]: r for r in owned}
+            for cid in shared_ids:
+                r = db.get_collection_by_id(conn, cid)
+                if r is not None:
+                    by_id[r["id"]] = r
+            rows = list(by_id.values())
+
+        if not rows:
+            return f"Коллекция «{requested}» не найдена." if requested else "Коллекций пока нет."
+
+        multi = len(rows) > 1
+        blocks: List[str] = []
+        for r in rows:
+            docs = db.list_documents(conn, r["id"], limit=limit)
+            if not docs:
+                body = "(документов нет)"
+            else:
+                doc_lines = []
+                for d_row in docs:
+                    source_uri = d_row.get("source_uri") or "?"
+                    title = d_row.get("title")
+                    label = title or source_uri
+                    # title теперь человекочитаемый (после фикса заголовков) --
+                    # показываем source_uri отдельным полем, только когда он
+                    # добавляет информацию сверх label (иначе строка задвоится).
+                    if title and title != source_uri:
+                        doc_lines.append(f"{label} — {source_uri} — {d_row['live_chunks']} фрагм.")
+                    else:
+                        doc_lines.append(f"{label} — {d_row['live_chunks']} фрагм.")
+                body = "\n".join(doc_lines)
+            blocks.append(f"«{r['name']}»:\n{body}" if multi else body)
+    finally:
+        conn.close()
+
+    return "\n\n".join(blocks) if multi else blocks[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +1449,301 @@ def memobase_quarantine_review(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# YouTube raw tools (owner-only): list a channel's recent videos, pull one
+# video's caption transcript (cheap), or force the audio->STT path (expensive).
+# All three spend real money on external providers, so each is gated by
+# `_require_privileged` exactly like the MULTIUSER admin tools above. Guests who
+# want a channel in their KB go through `memobase_ingest(source_type="youtube")`
+# with its own cost/quota gate — these raw tools are an owner research/prep
+# convenience, deliberately not part of the guest surface.
+# ---------------------------------------------------------------------------
+
+
+def _format_transcript_segments(segments: List[Dict[str, Any]]) -> str:
+    """Render transcript/STT segments as timecoded ``[mm:ss] text`` lines —
+    ready to drop back into MemoBase as ONE md document per video (the whole
+    point of the raw-transcript tools). Пустые строки между сегментами
+    обязательны: chunk.py режет прозу по пустым строкам — одиночные \n дали
+    бы один гигантский чанк (репортнутый баг)."""
+    from . import youtube as youtube_mod
+
+    lines = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{youtube_mod.format_hms(seg.get('start_sec'))}] {text}")
+    return "\n\n".join(lines)
+
+
+def _audio_stt_output(video_id: str, memobase_cfg: Dict[str, Any]) -> str:
+    """Скачать аудио (Apify) + распознать через STT → готовый таймкод-транскрипт.
+    Общая начинка memobase_youtube_dl_audio и opt-in фолбэка get_transcript."""
+    from . import stt as stt_mod
+    from . import youtube as youtube_mod
+
+    try:
+        audio_bytes, filename = youtube_mod.download_audio_apify(video_id)
+    except youtube_mod.YoutubeError as exc:
+        return f"Не удалось скачать аудио видео {video_id}: {exc}"
+    try:
+        stt_result = stt_mod.transcribe_long_audio(audio_bytes, filename_hint=filename, memobase_cfg=memobase_cfg)
+    except Exception as exc:  # noqa: BLE001 - surface STT failure as an honest message, not a crash
+        # Keep the chat message compact (stt.py's own errors are already
+        # short post-fix, but this caps defensively regardless of exception
+        # type) -- the full exception goes to the debug log only.
+        logger.debug("STT fallback failed for video %s", video_id, exc_info=True)
+        return f"STT fallback failed: {str(exc)[:200]} (video {video_id})"
+
+    segments = stt_result.get("segments") or []
+    if not segments:
+        return f"Аудио видео {video_id} скачано, но STT не выдал ни одного сегмента."
+
+    header = (
+        f"Видео {video_id} — транскрипт по аудио "
+        f"(STT: {stt_result.get('provider', 'unknown')}, сегментов {len(segments)}).\n"
+        f"{youtube_mod.video_watch_url(video_id)}\n"
+    )
+    if stt_result.get("trust") == "low":
+        header += "⚠ Таймкоды указаны моделью (Gemini-фолбэк), доверие низкое — проверяйте по видео.\n"
+    return header + "\n" + _format_transcript_segments(segments)
+
+
+MEMOBASE_YOUTUBE_LIST_CHANNEL_SCHEMA: Dict[str, Any] = {
+    "name": "memobase_youtube_list_channel",
+    "description": (
+        "Список свежих видео YouTube-канала (только для владельца базы знаний). Возвращает "
+        "video_id, дату, длительность и заголовок, отсортированные от новых к старым — чтобы затем "
+        "выборочно забрать транскрипты через memobase_youtube_get_transcript. Тратит кредиты "
+        "ScrapeCreators/Apify."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "channel": {"type": "string", "description": "Канал: @handle, URL канала или ID (UC...)."},
+            "limit": {"type": "integer", "description": "Сколько видео вернуть (по умолчанию 30)."},
+            "since": {"type": "string", "description": "Только видео не раньше этой даты, формат YYYY-MM-DD (опционально)."},
+            "max_pages": {"type": "integer", "description": "Сколько страниц по 30 видео листать (по умолчанию — достаточно под limit)."},
+        },
+        "required": ["channel"],
+    },
+}
+
+
+def memobase_youtube_list_channel(args: Dict[str, Any], **kwargs: Any) -> str:
+    session_id = kwargs.get("session_id")
+    memobase_cfg = kb_config.get_memobase_config_readonly()
+    refusal = _require_privileged(session_id, memobase_cfg)
+    if refusal:
+        return refusal
+
+    from . import youtube as youtube_mod
+
+    channel = (args.get("channel") or "").strip()
+    if not channel:
+        return "Параметр channel обязателен (@handle, URL канала или ID)."
+    limit = int(args.get("limit") or 30)
+    if limit < 1:
+        limit = 30
+
+    since = (args.get("since") or "").strip() or None
+    since_date = None
+    if since:
+        since_date, since_error = youtube_mod.parse_since_date(since)
+        if since_error:
+            return since_error
+
+    max_pages = args.get("max_pages")
+    if max_pages is not None:
+        max_pages = int(max_pages)
+        if max_pages < 1:
+            max_pages = 1
+    else:
+        max_pages = max(1, -(-limit // youtube_mod.SC_PAGE_SIZE))  # ceil(limit / page size)
+
+    try:
+        raw_videos, provider = youtube_mod.list_channel_videos(
+            channel, memobase_cfg=memobase_cfg, max_pages=max_pages
+        )
+    except youtube_mod.YoutubeError as exc:
+        return f"Не удалось получить список видео канала «{channel}»: {exc}"
+
+    videos, possibly_more = youtube_mod.sort_and_filter_videos(raw_videos, limit=limit, since_date=since_date)
+    if not videos:
+        if since:
+            return (
+                f"У канала «{channel}» нет видео не раньше {since} "
+                f"(просмотрено {len(raw_videos)} шт., источник: {provider})."
+            )
+        return f"У канала «{channel}» не найдено видео (источник: {provider})."
+
+    lines = [f"Канал «{channel}»: {len(videos)} видео (источник: {provider}, сортировка: новые сверху)."]
+    for i, v in enumerate(videos, start=1):
+        dur = youtube_mod.format_duration(v.get("duration_s"))
+        published = v.get("published_at") or "?"
+        title = v.get("title") or "(без названия)"
+        lines.append(f"{i}. {v.get('video_id')} | {published} | {dur} | {title}")
+        lines.append(f"   {v.get('url')}")
+    if since and possibly_more:
+        lines.append(
+            f"(Достигнут предел max_pages={max_pages}; возможно, за период есть ещё видео — "
+            f"увеличьте max_pages, чтобы посмотреть глубже.)"
+        )
+    return "\n".join(lines)
+
+
+MEMOBASE_YOUTUBE_GET_TRANSCRIPT_SCHEMA: Dict[str, Any] = {
+    "name": "memobase_youtube_get_transcript",
+    "description": (
+        "Полный таймкод-транскрипт одного YouTube-видео по субтитрам (только для владельца) — чистый "
+        "ASR, готовый лечь md-документом на ролик. Только субтитры (дёшево); если их нет — подскажет "
+        "memobase_youtube_dl_audio. Тратит кредиты ScrapeCreators/Apify."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "video": {"type": "string", "description": "ID видео или ссылка (watch/youtu.be/shorts)."},
+            "language": {"type": "string", "description": "Язык субтитров (по умолчанию 'ru')."},
+            "prefer_provider": {
+                "type": "string",
+                "enum": ["scrapecreators", "apify"],
+                "description": "Какого провайдера субтитров пробовать первым (опционально).",
+            },
+            "max_segments": {"type": "integer", "description": "Обрезать вывод до N сегментов (по умолчанию — все)."},
+            "from_sec": {"type": "number", "description": "Показывать сегменты начиная с этого таймкода, сек (опционально)."},
+            "to_sec": {"type": "number", "description": "Показывать сегменты до этого таймкода включительно, сек (опционально)."},
+            "allow_audio_fallback": {
+                "type": "boolean",
+                "description": (
+                    "Если субтитров нет — скачать аудио и распознать через STT "
+                    "(ПЛАТНО, как memobase_youtube_dl_audio). По умолчанию false."
+                ),
+            },
+        },
+        "required": ["video"],
+    },
+}
+
+
+def memobase_youtube_get_transcript(args: Dict[str, Any], **kwargs: Any) -> str:
+    session_id = kwargs.get("session_id")
+    memobase_cfg = kb_config.get_memobase_config_readonly()
+    refusal = _require_privileged(session_id, memobase_cfg)
+    if refusal:
+        return refusal
+
+    from . import youtube as youtube_mod
+
+    video = (args.get("video") or "").strip()
+    if not video:
+        return "Параметр video обязателен (ID или ссылка на видео)."
+    try:
+        video_id = youtube_mod.parse_video_id(video)
+    except youtube_mod.YoutubeError as exc:
+        return str(exc)
+
+    language = (args.get("language") or "ru").strip() or "ru"
+    prefer = (args.get("prefer_provider") or "").strip().lower() or None
+    cfg = memobase_cfg
+    if prefer:
+        if prefer not in youtube_mod.DEFAULT_TRANSCRIPT_PROVIDERS:
+            return (
+                f"Неизвестный провайдер prefer_provider: «{prefer}». "
+                f"Допустимо: {', '.join(youtube_mod.DEFAULT_TRANSCRIPT_PROVIDERS)}."
+            )
+        order = [prefer] + [p for p in youtube_mod.DEFAULT_TRANSCRIPT_PROVIDERS if p != prefer]
+        cfg = {**memobase_cfg, "youtube": {**(memobase_cfg.get("youtube") or {}), "transcript_providers": order}}
+
+    try:
+        segments, provider = youtube_mod.get_transcript(video_id, memobase_cfg=cfg, language=language)
+    except youtube_mod.YoutubeError as exc:
+        return f"Не удалось получить субтитры видео {video_id}: все провайдеры недоступны ({exc})."
+
+    if not segments:
+        if args.get("allow_audio_fallback"):
+            return (
+                "Субтитров нет — выполняю платный audio+STT фолбэк.\n\n"
+                + _audio_stt_output(video_id, memobase_cfg)
+            )
+        return (
+            f"У видео {video_id} нет субтитров ни у одного провайдера. "
+            f"Чтобы распознать речь с аудио (платно, STT), используйте memobase_youtube_dl_audio "
+            f"или повторите с allow_audio_fallback=true."
+        )
+
+    total = len(segments)
+    from_sec = args.get("from_sec")
+    to_sec = args.get("to_sec")
+    if from_sec is not None:
+        from_sec = max(0.0, float(from_sec))
+        segments = [s for s in segments if (s.get("start_sec") or 0) >= from_sec]
+    if to_sec is not None:
+        to_sec = max(0.0, float(to_sec))
+        segments = [s for s in segments if (s.get("start_sec") or 0) <= to_sec]
+    max_segments = args.get("max_segments")
+    if max_segments is not None and int(max_segments) > 0:
+        segments = segments[: int(max_segments)]
+    if not segments:
+        return f"В заданном диапазоне сегментов нет (всего {total})."
+
+    shown_note = ""
+    if len(segments) < total:
+        rng = ""
+        if from_sec is not None or to_sec is not None:
+            rng = (
+                f", диапазон {youtube_mod.format_hms(from_sec or 0)}–"
+                f"{youtube_mod.format_hms(to_sec) if to_sec is not None else 'конец'}"
+            )
+        shown_note = f"Показано {len(segments)} из {total} сегментов{rng}.\n"
+
+    duration = youtube_mod.format_hms(max((s.get("end_sec") or s.get("start_sec") or 0) for s in segments))
+    header = (
+        f"Видео {video_id} — транскрипт по субтитрам (сегментов {len(segments)}, "
+        f"длительность ~{duration}, язык {language}, источник: {provider}).\n"
+        f"{youtube_mod.video_watch_url(video_id)}\n"
+        + shown_note
+    )
+    return header + "\n" + _format_transcript_segments(segments)
+
+
+MEMOBASE_YOUTUBE_DL_AUDIO_SCHEMA: Dict[str, Any] = {
+    "name": "memobase_youtube_dl_audio",
+    "description": (
+        "Скачать аудио YouTube-видео (Apify) и распознать речь через STT (только для владельца) — "
+        "явный дорогой путь для видео БЕЗ субтитров. Возвращает таймкод-транскрипт с пометкой "
+        "доверия. Тратит Apify + STT (Groq/Gemini)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "video": {"type": "string", "description": "ID видео или ссылка."},
+        },
+        "required": ["video"],
+    },
+}
+
+
+def memobase_youtube_dl_audio(args: Dict[str, Any], **kwargs: Any) -> str:
+    session_id = kwargs.get("session_id")
+    memobase_cfg = kb_config.get_memobase_config_readonly()
+    refusal = _require_privileged(session_id, memobase_cfg)
+    if refusal:
+        return refusal
+
+    from . import youtube as youtube_mod
+
+    video = (args.get("video") or "").strip()
+    if not video:
+        return "Параметр video обязателен (ID или ссылка на видео)."
+    try:
+        video_id = youtube_mod.parse_video_id(video)
+    except youtube_mod.YoutubeError as exc:
+        return str(exc)
+
+    return _audio_stt_output(video_id, memobase_cfg)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -1277,6 +1761,7 @@ def register(ctx: Any) -> None:
     ctx.register_tool("memobase_list", "memobase", MEMOBASE_LIST_SCHEMA, memobase_list, emoji="📋")
     ctx.register_tool("memobase_delete", "memobase", MEMOBASE_DELETE_SCHEMA, memobase_delete, emoji="🗑️")
     ctx.register_tool("memobase_status", "memobase", MEMOBASE_STATUS_SCHEMA, memobase_status, emoji="ℹ️")
+    ctx.register_tool("memobase_list_documents", "memobase", MEMOBASE_LIST_DOCUMENTS_SCHEMA, memobase_list_documents, emoji="📄")
     ctx.register_tool("memobase_selfcheck", "memobase", MEMOBASE_SELFCHECK_SCHEMA, memobase_selfcheck, emoji="✅")
     ctx.register_tool("memobase_map", "memobase", MEMOBASE_MAP_SCHEMA, memobase_map, emoji="🗺️")
     ctx.register_tool("memobase_create_for", "memobase", MEMOBASE_CREATE_FOR_SCHEMA, memobase_create_for, emoji="👤")
@@ -1285,3 +1770,6 @@ def register(ctx: Any) -> None:
     ctx.register_tool("memobase_set_guest_quota", "memobase", MEMOBASE_SET_GUEST_QUOTA_SCHEMA, memobase_set_guest_quota, emoji="⚖️")
     ctx.register_tool("memobase_quarantine_list", "memobase", MEMOBASE_QUARANTINE_LIST_SCHEMA, memobase_quarantine_list, emoji="🕵️")
     ctx.register_tool("memobase_quarantine_review", "memobase", MEMOBASE_QUARANTINE_REVIEW_SCHEMA, memobase_quarantine_review, emoji="🧾")
+    ctx.register_tool("memobase_youtube_list_channel", "memobase", MEMOBASE_YOUTUBE_LIST_CHANNEL_SCHEMA, memobase_youtube_list_channel, emoji="📺")
+    ctx.register_tool("memobase_youtube_get_transcript", "memobase", MEMOBASE_YOUTUBE_GET_TRANSCRIPT_SCHEMA, memobase_youtube_get_transcript, emoji="📝")
+    ctx.register_tool("memobase_youtube_dl_audio", "memobase", MEMOBASE_YOUTUBE_DL_AUDIO_SCHEMA, memobase_youtube_dl_audio, emoji="🎧")

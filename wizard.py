@@ -273,7 +273,7 @@ def handle_message(chat_id: str, user_id: str, text: str, memobase_cfg: Dict[str
             return f"Не удалось сохранить ключ: {exc}. Попробуйте прислать его ещё раз."
         ok, msg = validate_provider_key(provider)
         masked = mask_secret(text)
-        prefix = f"Ключ ({masked}) сохранён — {msg}.\n\n{detect_obsidian_message()}"
+        prefix = f"Ключ ({masked}) сохранён в {setup_core.env_file_path()} — {msg}.\n\n{detect_obsidian_message()}"
         return _advance_to(chat_id, entry, "first_ingest", prefix=prefix)
 
     if step == "first_ingest":

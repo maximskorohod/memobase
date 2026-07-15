@@ -221,7 +221,12 @@ def transcribe_groq(audio_path: str, *, filename: str = "audio.flac") -> List[Di
     }
     resp = _request_with_backoff("POST", GROQ_URL, headers=headers, data=data, files=files)
     if resp.status_code != 200:
-        raise SttError(f"Groq STT call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        # The provider's raw response body (often JSON) must never reach a
+        # user-facing message (tools.py's _audio_stt_output would otherwise
+        # dump it straight into the chat) -- full body only to the debug
+        # log, for whoever is actually debugging this.
+        logger.debug("Groq STT call failed: HTTP %s body=%s", resp.status_code, resp.text)
+        raise SttError(f"STT groq HTTP {resp.status_code}")
     try:
         payload = resp.json()
     except ValueError as exc:
@@ -279,7 +284,10 @@ def transcribe_gemini(audio_path: str) -> List[Dict[str, Any]]:
     url = GEMINI_URL_TMPL.format(model=GEMINI_MODEL, key=api_key)
     resp = _request_with_backoff("POST", url, json_body=body, timeout=300.0)
     if resp.status_code != 200:
-        raise SttError(f"Gemini STT call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        # See transcribe_groq's identical note -- raw provider body only to
+        # debug log, never into the user-facing exception message.
+        logger.debug("Gemini STT call failed: HTTP %s body=%s", resp.status_code, resp.text)
+        raise SttError(f"STT gemini HTTP {resp.status_code}")
     try:
         payload = resp.json()
         text_out = payload["candidates"][0]["content"]["parts"][0]["text"]
@@ -437,6 +445,19 @@ def _delete_file_best_effort(path: str) -> None:
         logger.debug("could not delete %s (best-effort cleanup)", path, exc_info=True)
 
 
+def _safe_probe_duration_s(path: str) -> Optional[float]:
+    """Best-effort wrapper around :func:`_probe_duration_s` -- duration is an
+    observability nicety, never worth failing an otherwise-successful
+    transcription over. In particular the small-file Groq path below needs
+    no ffmpeg at all, so a machine without it must still transcribe fine;
+    this just means ``duration_s`` comes back ``None``."""
+    try:
+        return _probe_duration_s(path)
+    except SttError:
+        logger.debug("duration probe failed for %s (non-fatal)", path, exc_info=True)
+        return None
+
+
 def transcribe_long_audio(
     audio: "bytes | str", *, filename_hint: str = "audio", memobase_cfg: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -444,13 +465,19 @@ def transcribe_long_audio(
     disk), applying the ffmpeg chunk+merge ladder for files over Groq's
     25MB cap, with a Gemini whole-file fallback if Groq is unavailable/over
     quota. Returns ``{"segments": [...], "provider": "groq"|"gemini",
-    "trust": "high"|"low", "low_confidence_boundaries": [...]}``.
+    "trust": "high"|"low", "low_confidence_boundaries": [...],
+    "chunk_count": <int>, "duration_s": <float | None>}`` (``chunk_count`` is
+    ``1`` for a whole-file transcription — the direct Groq path or the Gemini
+    fallback — and the actual ffmpeg-split piece count when Groq's 25MB chunk
+    ladder ran; ``duration_s`` is a best-effort ffprobe read of the WHOLE
+    input, ``None`` if ffmpeg/ffprobe is unavailable or the probe fails —
+    see :func:`_safe_probe_duration_s`).
 
     Deletes any temp file THIS function created (the downloaded/converted/
-    chunked audio) after a SUCCESSFUL transcription (§1.9 #19); if *audio*
-    was passed as a path, that original file is left alone (caller owns its
-    lifecycle) — only files created internally (chunks, format conversions)
-    are cleaned up here.
+    chunked audio) after a SUCCESSFUL transcription; if *audio* was passed
+    as a path, that original file is left alone (caller owns its lifecycle)
+    — only files created internally (chunks, format conversions) are
+    cleaned up here.
     """
     preset = ((memobase_cfg or {}).get("stt") or {}).get("preset", DEFAULT_PRESET)
 
@@ -470,11 +497,21 @@ def transcribe_long_audio(
 
     try:
         size = os.path.getsize(input_path)
+        # Probed ONCE, up front, regardless of which path below ends up
+        # transcribing -- best-effort (None on failure), see
+        # _safe_probe_duration_s. chunk_audio_file() below re-probes this
+        # same file for its own slicing math; a second local ffprobe call is
+        # a cheap, non-monetary duplication, not worth threading a value
+        # through chunk_audio_file's signature to avoid.
+        duration_s = _safe_probe_duration_s(input_path)
         if preset == "groq" or preset == DEFAULT_PRESET:
             try:
                 if size <= GROQ_MAX_BYTES:
                     segments = transcribe_groq(input_path, filename=os.path.basename(filename_hint))
-                    return {"segments": segments, "provider": "groq", "trust": "high", "low_confidence_boundaries": []}
+                    return {
+                        "segments": segments, "provider": "groq", "trust": "high",
+                        "low_confidence_boundaries": [], "chunk_count": 1, "duration_s": duration_s,
+                    }
                 chunk_infos = chunk_audio_file(input_path, tmp_dir=workdir)
                 chunk_results = []
                 for chunk_path, offset in chunk_infos:
@@ -484,12 +521,16 @@ def transcribe_long_audio(
                 return {
                     "segments": merged["segments"], "provider": "groq", "trust": "high",
                     "low_confidence_boundaries": merged["low_confidence_boundaries"],
+                    "chunk_count": len(chunk_infos), "duration_s": duration_s,
                 }
             except SttError as exc:
                 logger.warning("Groq STT failed (%s); falling back to Gemini", exc)
 
         segments = transcribe_gemini(input_path)
-        return {"segments": segments, "provider": "gemini", "trust": "low", "low_confidence_boundaries": []}
+        return {
+            "segments": segments, "provider": "gemini", "trust": "low",
+            "low_confidence_boundaries": [], "chunk_count": 1, "duration_s": duration_s,
+        }
     finally:
         for p in created_paths:
             if p == workdir:
@@ -544,7 +585,15 @@ def extract_media(source: str, *, source_type: str, memobase_cfg: Optional[Dict[
             skipped.append({"reason": f"low-confidence chunk merge at boundary {lc.get('boundary_chunk_index')}"})
         return {
             "text": text, "blocks": blocks,
-            "meta": {"title": os.path.basename(source), "pages": None, "stt_provider": result.get("provider")},
+            "meta": {
+                "title": os.path.basename(source), "pages": None, "stt_provider": result.get("provider"),
+                # Threaded straight through from transcribe_long_audio's own
+                # result -- ingest.py's final "done" result picks these up
+                # from this same meta dict (renamed there to avoid colliding
+                # with its own chunks_* text-chunk fields).
+                "chunk_count": result.get("chunk_count"),
+                "duration_s": result.get("duration_s"),
+            },
             "skipped": skipped,
         }
     finally:

@@ -130,6 +130,68 @@ class TestGuestAcl:
         assert "coll_a" in out
         assert "coll_b" not in out
 
+    def _seed_doc(self, conn, collection_id, source_uri, title):
+        doc_id = conn.execute(
+            "INSERT INTO documents(collection_id, source_uri, source_type, content_sha256, title, ingested_at) "
+            "VALUES (?, ?, 'txt', 'h', ?, 0)",
+            (collection_id, source_uri, title),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO chunks(collection_id, document_id, seq, text, content_sha256, created_at) "
+            "VALUES (?, ?, 0, 'text', 'ch', 0)",
+            (collection_id, doc_id),
+        )
+        conn.commit()
+        return doc_id
+
+    def _make_two_guest_collections_with_docs(self, kb, conn):
+        cid_a, cid_b = self._make_two_guest_collections(kb, conn)
+        self._seed_doc(conn, cid_a, "a-doc.txt", "A Doc")
+        self._seed_doc(conn, cid_b, "b-doc.txt", "B Doc")
+        return cid_a, cid_b
+
+    def test_guest_cannot_list_documents_of_another_guests_collection(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            self._make_two_guest_collections_with_docs(kb, conn)
+        finally:
+            conn.close()
+        kb.tools.bind_session_user("sess-a", "guest-a")
+        out = kb.tools.memobase_list_documents({"collection": "coll_b"}, session_id="sess-a")
+        assert "не найдена" in out  # same default-deny framing as memobase_query/memobase_status
+        assert "b-doc.txt" not in out
+
+    def test_guest_can_list_documents_of_own_collection(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            self._make_two_guest_collections_with_docs(kb, conn)
+        finally:
+            conn.close()
+        kb.tools.bind_session_user("sess-a", "guest-a")
+        out = kb.tools.memobase_list_documents({"collection": "coll_a"}, session_id="sess-a")
+        assert "a-doc.txt" in out
+
+    def test_owner_sees_documents_of_any_collection_via_list_documents(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            self._make_two_guest_collections_with_docs(kb, conn)
+        finally:
+            conn.close()
+        # session_id=None -> unresolved identity -> privileged (CLI/owner)
+        out = kb.tools.memobase_list_documents({"collection": "coll_b"}, session_id=None)
+        assert "b-doc.txt" in out
+
+    def test_guest_list_documents_no_collection_only_shows_own(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            self._make_two_guest_collections_with_docs(kb, conn)
+        finally:
+            conn.close()
+        kb.tools.bind_session_user("sess-a", "guest-a")
+        out = kb.tools.memobase_list_documents({}, session_id="sess-a")
+        assert "a-doc.txt" in out
+        assert "b-doc.txt" not in out
+
 
 # ===========================================================================
 # memobase_create_for / memobase_share / memobase_share_revoke -- owner-only in code
@@ -226,6 +288,30 @@ class TestGuestQuota:
         kb.tools.bind_session_user("sess-i", "guest-i")
         out = kb.tools.memobase_ingest(
             {"source": str(p), "source_type": "txt", "collection": "guest_budget_coll"}, session_id="sess-i",
+        )
+        assert "бюджет" in out.lower()
+
+    def test_force_does_not_bypass_guest_daily_budget(self, kb, tmp_path):
+        """Fix H: `force=True` only bypasses the content-hash 'unchanged'
+        short-circuit inside ingest_source -- it must NOT let a guest
+        already over their daily $ budget slip past the SAME pre-ingest
+        gate (tools.py's _guest_pre_ingest_gate, which runs BEFORE
+        ingest_source is even called and has no idea `force` exists) that a
+        normal, non-forced ingest already hits."""
+        conn = kb.db.get_connection()
+        try:
+            kb.db.create_collection(conn, "guest_budget_force_coll", owner_user_id="guest-k", visibility="private")
+            kb.db.set_guest_quota(conn, "guest-k", daily_budget_usd=0.01)
+            kb.db.record_guest_usage(conn, "guest-k", usd_spent=0.02)  # already over
+        finally:
+            conn.close()
+
+        p = tmp_path / "doc.txt"
+        p.write_text("some text " * 50, encoding="utf-8")
+        kb.tools.bind_session_user("sess-k", "guest-k")
+        out = kb.tools.memobase_ingest(
+            {"source": str(p), "source_type": "txt", "collection": "guest_budget_force_coll", "force": True},
+            session_id="sess-k",
         )
         assert "бюджет" in out.lower()
 

@@ -5,7 +5,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <a href="#installation"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#installation"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
-  <a href="tests/"><img alt="Tests: 285 passed" src="https://img.shields.io/badge/tests-285_passed-brightgreen"></a>
+  <a href="tests/"><img alt="Tests: 457 passed" src="https://img.shields.io/badge/tests-457_passed-brightgreen"></a>
   <a href="README.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
 </p>
 
@@ -14,7 +14,7 @@
   <a href="#features">Features</a> ·
   <a href="#installation">Installation</a> ·
   <a href="#settings">Settings</a> ·
-  <a href="#tools-14-and-commands">Tools</a> ·
+  <a href="#tools-18-and-commands">Tools</a> ·
   <a href="README.md">Русский</a> ·
   <a href="https://skorehood.com">skorehood.com</a> ·
   <a href="https://t.me/+XrhmiKgCQdY5MjFi">Telegram</a>
@@ -152,6 +152,11 @@ One command: the plugin gets copied into place, dependencies get installed, and 
    /memobase status
    ```
 
+   The output ends with a "Keys" block: the full `.env` path and each key's status
+   (`✓ configured` with a mask / `✗ not set` / `⚠ in .env but the process can't see
+   it yet` — saved, needs a restart). The block shows up even on an empty base,
+   before the first ingestion.
+
    If hermes-gateway runs as a `systemd --user` unit, the installer already wired an
    `EnvironmentFile` drop-in — newly-saved keys in `.env` take effect on `hermes gateway
    restart`, no manual unit edit needed. In a plain CLI session, `.env` is simply
@@ -210,9 +215,9 @@ All keys live under the `memobase.*` root in `config.yaml`; defaults are shown b
 
 > The sufficiency thresholds (`rerank` ≈ 0.15, `rrf-only` ≈ 0.02) are not `config.yaml` keys but default constants, used until a collection is calibrated with `memobase_selfcheck` (after calibration the values are stored per-collection in the DB). The RRF constant `k=60` is hard-coded and not configurable.
 
-## Tools (14) and commands
+## Tools (18) and commands
 
-The model sees 14 `memobase_*` tools; a human gets the same operations via `/memobase …` slash commands and `hermes memobase …` in a terminal.
+The model sees 18 `memobase_*` tools; a human gets the same operations via `/memobase …` slash commands and `hermes memobase …` in a terminal.
 
 | Tool | Command | What it does |
 |---|---|---|
@@ -220,6 +225,7 @@ The model sees 14 `memobase_*` tools; a human gets the same operations via `/mem
 | `memobase_ask` | `/memobase <question>` | An answer from the collection with verified citations, or an honest refusal. |
 | `memobase_query` | — | Raw fragments for a privileged caller, always fenced as "data, not instructions". |
 | `memobase_list` | `/memobase list` | List collections: documents, chunks, visibility, state. |
+| `memobase_list_documents` | `/memobase list-documents [collection]` | Documents inside a collection: title, source, live chunk count. |
 | `memobase_status` | `/memobase status [collection]` | Migration state, pending jobs, 30-day spend per provider. |
 | `memobase_delete` | `/memobase delete <collection>` | Delete an entire collection. |
 | `memobase_selfcheck` | `/memobase selfcheck <collection>` | Quality smoke test: control questions against random chunks + threshold calibration. |
@@ -230,8 +236,11 @@ The model sees 14 `memobase_*` tools; a human gets the same operations via `/mem
 | `memobase_set_guest_quota` | `hermes memobase set-guest-quota …` | Set per-guest quotas (owner only). |
 | `memobase_quarantine_list` | `/memobase quarantine [collection]` | The queue of guest chunks held by the injection scanner (owner only). |
 | `memobase_quarantine_review` | `hermes memobase quarantine-review …` | Approve/reject a quarantined chunk (owner only). |
+| `memobase_youtube_list_channel` | `/memobase youtube-list <channel> [limit]` | Recent channel videos: id, date, duration, title (owner only). |
+| `memobase_youtube_get_transcript` | `/memobase youtube-transcript <video>` | Timecoded transcript from captions; range `from_sec`/`to_sec`/`max_segments`; opt-in paid STT fallback `allow_audio_fallback` (owner only). |
+| `memobase_youtube_dl_audio` | `/memobase youtube-audio <video>` | Download audio and transcribe via STT — for videos without captions (paid, owner only). |
 
-The six owner-only tools (`create_for`, `share`, `share_revoke`, `set_guest_quota`, `quarantine_list`, `quarantine_review`) verify identity **in code** (`_require_privileged`, from the session's server-side identity), not by trusting the model to behave.
+The nine owner-only tools (`create_for`, `share`, `share_revoke`, `set_guest_quota`, `quarantine_list`, `quarantine_review`, `youtube_list_channel`, `youtube_get_transcript`, `youtube_dl_audio`) verify identity **in code** (`_require_privileged`, from the session's server-side identity), not by trusting the model to behave.
 
 Three more operations are terminal-only: `hermes memobase reindex` (re-embed after changing the embedding model), `hermes memobase backup-run` (a consistent `VACUUM INTO` snapshot with rotation — put it on cron), and `hermes memobase setup` (the setup wizard). Plus `/memobase setup` and `/memobase help`.
 
@@ -257,14 +266,18 @@ If no such clause exists in the document, MemoBase returns an honest refusal lik
 ## Tests
 
 ```
-285 passed, 2 deselected (integration tests are marked "not integration" and skipped)
+457 passed (2 of these are live Cloudflare/Cohere checks: they run when the
+keys are present in ~/.hermes/.env, and honestly skip themselves otherwise
+— they never fail for a missing key)
 ```
 
 Run from a neutral directory (not from inside the plugin folder — otherwise the local `tools.py` shadows the core package):
 
 ```
-<venv>/python.exe -m pytest tests -q --basetemp=<tmp>/memobase -m "not integration"
+<venv>/python.exe -m pytest tests -q --basetemp=<tmp>/memobase
 ```
+
+Fully offline, no live calls at all — add `-m "not integration"`.
 
 ## Limitations
 

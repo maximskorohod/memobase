@@ -255,6 +255,26 @@ def _build_context_block(candidates: List[Dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _oversized_note(candidates: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Optional[str]:
+    """gaps[]-нота, когда в выдаче есть сверхкрупные фрагменты (легаси-данные,
+    загруженные до force-split чанкера, см. chunk.CHUNKER_VERSION) — честная
+    подсказка, что перезаливка документа улучшит ответы."""
+    from . import chunk as chunk_mod
+
+    target = int(((cfg.get("chunk") or {}).get("target_tokens")) or 900)
+    big = [
+        chunk_mod.approx_tokens(c.get("text") or "")
+        for c in candidates
+        if chunk_mod.approx_tokens(c.get("text") or "") > 2 * target
+    ]
+    if not big:
+        return None
+    return (
+        f"в выдаче есть сверхкрупные фрагменты (~{max(big)} ток. при цели {target}) — "
+        f"перезагрузите документ (обновлённый чанкер), точность ответов вырастет"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -363,9 +383,10 @@ def answer(
     if raw_citations and not verified_citations:
         # Every citation was a citation-shaped hallucination (real chunk id,
         # quote not actually in it, or a made-up chunk id) — trust nothing.
+        note = _oversized_note(candidates, cfg)
         return {
             "answer": f"В базе знаний «{collection_name}» не удалось найти проверяемое подтверждение ответа.",
-            "citations": [], "gaps": [query], "mode": mode,
+            "citations": [], "gaps": [query] + ([note] if note else []), "mode": mode,
             "refused": True, "degraded": degraded, "near_miss": near_miss,
         }
 
@@ -373,9 +394,10 @@ def answer(
         # Model produced prose with no citations at all despite candidates
         # existing — the "answer only with forced citations" contract was
         # not honored; treat as insufficient rather than trust it uncited.
+        note = _oversized_note(candidates, cfg)
         return {
             "answer": f"В базе знаний «{collection_name}» не нашлось подтверждённого ответа на этот вопрос.",
-            "citations": [], "gaps": [query], "mode": mode,
+            "citations": [], "gaps": [query] + ([note] if note else []), "mode": mode,
             "refused": True, "degraded": degraded, "near_miss": near_miss,
         }
 

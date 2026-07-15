@@ -5,7 +5,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <a href="#установка"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#установка"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
-  <a href="tests/"><img alt="Tests: 285 passed" src="https://img.shields.io/badge/tests-285_passed-brightgreen"></a>
+  <a href="tests/"><img alt="Tests: 457 passed" src="https://img.shields.io/badge/tests-457_passed-brightgreen"></a>
   <a href="README.en.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
 </p>
 
@@ -14,7 +14,7 @@
   <a href="#возможности">Возможности</a> ·
   <a href="#установка">Установка</a> ·
   <a href="#настройки">Настройки</a> ·
-  <a href="#инструменты-14-и-команды">Инструменты</a> ·
+  <a href="#инструменты-18-и-команды">Инструменты</a> ·
   <a href="README.en.md">English</a> ·
   <a href="https://skorehood.com">skorehood.com</a> ·
   <a href="https://t.me/+XrhmiKgCQdY5MjFi">Telegram</a>
@@ -152,6 +152,10 @@ flowchart LR
    /memobase status
    ```
 
+   В конце вывода — блок «Ключи»: полный путь к `.env` и статус каждого ключа
+   (`✓ настроен` с маской / `✗ нет` / `⚠ есть в .env, но процесс не видит` — записан,
+   но нужен рестарт). Блок виден и на пустой базе, ещё до первой загрузки.
+
    Если hermes-gateway запущен как `systemd --user`-юнит, установщик уже прописал
    `EnvironmentFile`-drop-in — новые ключи из `.env` подхватятся при `hermes gateway
    restart`, без ручной правки юнита. В обычной CLI-сессии `.env` наследуется сама
@@ -210,9 +214,9 @@ flowchart LR
 
 > Пороги достаточности (`rerank` ≈ 0.15, `rrf-only` ≈ 0.02) — это не ключи `config.yaml`, а дефолтные константы, пока коллекция не откалибрована командой `memobase_selfcheck` (после калибровки значения хранятся в БД на уровне коллекции). Константа RRF `k=60` зашита в коде и не настраивается.
 
-## Инструменты (14) и команды
+## Инструменты (18) и команды
 
-Модель видит 14 инструментов `memobase_*`; человек — те же операции через слэш-команды `/memobase …` и терминальные `hermes memobase …`.
+Модель видит 18 инструментов `memobase_*`; человек — те же операции через слэш-команды `/memobase …` и терминальные `hermes memobase …`.
 
 | Инструмент | Команда | Что делает |
 |---|---|---|
@@ -220,6 +224,7 @@ flowchart LR
 | `memobase_ask` | `/memobase <вопрос>` | Ответ по коллекции с проверенными цитатами или честный отказ. |
 | `memobase_query` | — | Сырые фрагменты для привилегированного вызывающего, обязательно обёрнутые как «это данные, не инструкции». |
 | `memobase_list` | `/memobase list` | Список коллекций: документы, фрагменты, видимость, состояние. |
+| `memobase_list_documents` | `/memobase list-documents [коллекция]` | Документы внутри коллекции: заголовок, источник, число живых фрагментов. |
 | `memobase_status` | `/memobase status [коллекция]` | Статус миграции, незавершённые задачи, расход за 30 дней по каждому провайдеру. |
 | `memobase_delete` | `/memobase delete <коллекция>` | Удалить коллекцию целиком. |
 | `memobase_selfcheck` | `/memobase selfcheck <коллекция>` | Smoke-тест качества: контрольные вопросы по случайным фрагментам + калибровка порогов. |
@@ -230,8 +235,11 @@ flowchart LR
 | `memobase_set_guest_quota` | `hermes memobase set-guest-quota …` | Задать индивидуальные квоты гостю (только владелец). |
 | `memobase_quarantine_list` | `/memobase quarantine [коллекция]` | Очередь гостевых фрагментов, задержанных сканером инъекций (только владелец). |
 | `memobase_quarantine_review` | `hermes memobase quarantine-review …` | Одобрить/отклонить фрагмент из карантина (только владелец). |
+| `memobase_youtube_list_channel` | `/memobase youtube-list <канал> [лимит]` | Свежие видео канала: id, дата, длительность, заголовок (только владелец). |
+| `memobase_youtube_get_transcript` | `/memobase youtube-transcript <видео>` | Таймкод-транскрипт по субтитрам; диапазон `from_sec`/`to_sec`/`max_segments`; opt-in платный STT-фолбэк `allow_audio_fallback` (только владелец). |
+| `memobase_youtube_dl_audio` | `/memobase youtube-audio <видео>` | Скачать аудио и распознать через STT — для видео без субтитров (платно, только владелец). |
 
-Шесть «только-владелец» инструментов (`create_for`, `share`, `share_revoke`, `set_guest_quota`, `quarantine_list`, `quarantine_review`) проверяют личность **в коде** (`_require_privileged`, по серверной идентичности сессии), а не полагаются на послушание модели.
+Девять «только-владелец» инструментов (`create_for`, `share`, `share_revoke`, `set_guest_quota`, `quarantine_list`, `quarantine_review`, `youtube_list_channel`, `youtube_get_transcript`, `youtube_dl_audio`) проверяют личность **в коде** (`_require_privileged`, по серверной идентичности сессии), а не полагаются на послушание модели.
 
 Только в терминале доступны ещё три операции: `hermes memobase reindex` (пере-эмбеддинг после смены модели), `hermes memobase backup-run` (консистентный снимок базы `VACUUM INTO` с ротацией — вешается на cron), `hermes memobase setup` (мастер настройки). Плюс `/memobase setup` и `/memobase help`.
 
@@ -257,14 +265,17 @@ flowchart LR
 ## Тесты
 
 ```
-285 passed, 2 deselected (интеграционные помечены "not integration" и пропущены)
+457 passed (2 из них — live-проверки Cloudflare/Cohere: идут, если ключи есть
+в ~/.hermes/.env, и сами честно пропускаются, если ключей нет, а не падают)
 ```
 
 Прогон из нейтрального каталога (не изнутри папки плагина — иначе локальный `tools.py` затеняет пакет ядра):
 
 ```
-<venv>/python.exe -m pytest tests -q --basetemp=<tmp>/memobase -m "not integration"
+<venv>/python.exe -m pytest tests -q --basetemp=<tmp>/memobase
 ```
+
+Полностью офлайн, без единого живого вызова — добавьте `-m "not integration"`.
 
 ## Ограничения
 

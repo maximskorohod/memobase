@@ -9,6 +9,7 @@ test) — see conftest.py's module docstring.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -239,6 +240,44 @@ class TestYoutubeExtractVideoNeverRaises:
         assert doc["skipped"]
 
 
+class TestYoutubeMetaHintTitle:
+    """Fix A: documents.title used to always come back as the bare video id
+    (build_video_doc's ``video_meta.get("title") or video_meta.get("video_id")``
+    fallback, with video_meta never actually carrying a title) -- meta_hint
+    (from ingest_channel's already-known listing title, or any caller who
+    already knows the title) must win over that fallback."""
+
+    def test_meta_hint_title_used_over_video_id(self, kb, monkeypatch):
+        monkeypatch.setattr(
+            kb.youtube, "get_transcript",
+            lambda video_id, **kw: ([{"text": "hi there", "start_sec": 0.0, "end_sec": 1.0}], "scrapecreators"),
+        )
+        doc = kb.youtube.extract_video(
+            "https://youtu.be/dQw4w9WgXcQ", memobase_cfg={}, meta_hint={"title": "Настоящее Название"}
+        )
+        assert doc["meta"]["title"] == "Настоящее Название"
+
+    def test_no_meta_hint_falls_back_to_video_id_unchanged(self, kb, monkeypatch):
+        """Baseline/regression: with no hint and nothing from the provider,
+        behavior is exactly what it was before Fix A."""
+        monkeypatch.setattr(
+            kb.youtube, "get_transcript",
+            lambda video_id, **kw: ([{"text": "hi there", "start_sec": 0.0, "end_sec": 1.0}], "scrapecreators"),
+        )
+        doc = kb.youtube.extract_video("https://youtu.be/dQw4w9WgXcQ", memobase_cfg={})
+        assert doc["meta"]["title"] == "dQw4w9WgXcQ"
+
+    def test_falsy_meta_hint_title_falls_back_to_video_id(self, kb, monkeypatch):
+        """A falsy hint ({"title": None}/{}) must not crash and must behave
+        exactly like no hint at all."""
+        monkeypatch.setattr(
+            kb.youtube, "get_transcript",
+            lambda video_id, **kw: ([{"text": "hi", "start_sec": 0.0, "end_sec": 1.0}], "scrapecreators"),
+        )
+        doc = kb.youtube.extract_video("https://youtu.be/dQw4w9WgXcQ", memobase_cfg={}, meta_hint={"title": None})
+        assert doc["meta"]["title"] == "dQw4w9WgXcQ"
+
+
 class TestYoutubeChannelIngestConfirmGate:
     def test_needs_confirmation_over_threshold(self, kb, monkeypatch):
         conn = kb.db.get_connection()
@@ -276,6 +315,194 @@ class TestYoutubeChannelIngestConfirmGate:
             assert calls == [("https://youtu.be/v1", "youtube")]
         finally:
             conn.close()
+
+    def test_confirmed_ingest_passes_listing_title_as_meta_hint(self, kb, monkeypatch):
+        """Fix A: ingest_channel already has each video's title from the
+        channel listing (_sc_video_entry/channel_videos_apify) -- it must be
+        threaded through to ingest_source as meta_hint so documents.title
+        doesn't degrade to the bare video id."""
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "ytcoll3", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            videos = [
+                {"video_id": "v1", "url": "https://youtu.be/v1", "title": "Настоящий Заголовок",
+                 "published_at": None, "duration_s": 60},
+                {"video_id": "v2", "url": "https://youtu.be/v2", "title": None,
+                 "published_at": None, "duration_s": 60},
+            ]
+            monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda channel, **kw: (videos, "scrapecreators"))
+
+            meta_hints = []
+
+            def fake_ingest_source(conn_, collection_row, source, source_type, **kw):
+                meta_hints.append(kw.get("meta_hint"))
+                return {"status": "done"}
+
+            monkeypatch.setattr(kb.ingest, "ingest_source", fake_ingest_source)
+            memobase_cfg = kb.config.get_memobase_config_readonly()
+            result = kb.youtube.ingest_channel(conn, row, "https://www.youtube.com/@x", memobase_cfg=memobase_cfg, confirm=True)
+            assert result["status"] == "done"
+            assert meta_hints == [{"title": "Настоящий Заголовок"}, None]
+        finally:
+            conn.close()
+
+    def test_needs_confirmation_includes_videos_preview(self, kb, monkeypatch):
+        vids = [
+            {"video_id": f"v{i:02d}", "url": f"https://youtu.be/v{i:02d}", "title": f"Видео {i}",
+             "published_at": "2026-07-01", "duration_s": 60}
+            for i in range(25)
+        ]
+        monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda *a, **k: (vids, "scrapecreators"))
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "ytprev", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            result = kb.youtube.ingest_channel(conn, row, "@x", memobase_cfg={}, confirm=False)
+        finally:
+            conn.close()
+        assert result["status"] == "needs_confirmation"
+        assert len(result["videos_preview"]) == 10
+        assert result["videos_preview"][0]["title"] == "Видео 0"
+
+    def test_formatter_shows_preview_and_failed(self, kb):
+        text = kb.tools._format_multi_item_result(
+            {
+                "status": "needs_confirmation", "message": "Смета.", "video_count": 25,
+                "videos_preview": [{"video_id": "v01", "published_at": "2026-07-01", "title": "Видео 1"}],
+            },
+            name="c", kind="канала",
+        )
+        assert "v01" in text and "Видео 1" in text and "и ещё 24" in text
+        text2 = kb.tools._format_multi_item_result(
+            {
+                "status": "done", "video_count": 2, "videos_done": 1, "videos_unchanged": 0,
+                "videos_failed": 1, "list_provider": "scrapecreators",
+                "per_video": [
+                    {"video_id": "ok1", "status": "done", "title": "Хорошее"},
+                    {"video_id": "bad", "status": "failed", "title": "Плохое"},
+                ],
+            },
+            name="c", kind="канала",
+        )
+        assert "bad | failed" in text2
+        assert text2.index("bad") < text2.index("ok1")  # failed first
+
+
+class TestYoutubeChannelPerVideoObservability:
+    """Fixes D/E/G: per_video used to carry only video_id/status/title/
+    published_at, silently dropping ingest_source's own `error` (D), the
+    transcript provider it picked (E), and its per-call embed cost (G's
+    channel-level extension) -- all three are already computed by
+    ingest_source per video, just never threaded back out of ingest_channel."""
+
+    def _channel(self, kb, conn, name="ytobs"):
+        cid = kb.db.create_collection(conn, name, embedder_dims=3)
+        return kb.db.get_collection_by_id(conn, cid)
+
+    def test_per_video_carries_failure_reason(self, kb, monkeypatch):
+        conn = kb.db.get_connection()
+        try:
+            row = self._channel(kb, conn, "ytreason")
+            videos = [{"video_id": "bad1", "url": "https://youtu.be/bad1", "title": "T",
+                       "published_at": None, "duration_s": 60}]
+            monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda channel, **kw: (videos, "scrapecreators"))
+
+            def fake_ingest_source(conn_, collection_row, source, source_type, **kw):
+                return {"status": "failed", "error": "ScrapeCreators /v1/... failed: HTTP 402: no credits left"}
+
+            monkeypatch.setattr(kb.ingest, "ingest_source", fake_ingest_source)
+            memobase_cfg = kb.config.get_memobase_config_readonly()
+            result = kb.youtube.ingest_channel(conn, row, "https://www.youtube.com/@x", memobase_cfg=memobase_cfg, confirm=True)
+            assert result["per_video"][0]["status"] == "failed"
+            assert "402" in result["per_video"][0]["reason"]
+        finally:
+            conn.close()
+
+    def test_per_video_success_has_no_reason(self, kb, monkeypatch):
+        """A successful video must not show a stale/misleading reason."""
+        conn = kb.db.get_connection()
+        try:
+            row = self._channel(kb, conn, "ytnoreason")
+            videos = [{"video_id": "ok1", "url": "https://youtu.be/ok1", "title": "T",
+                       "published_at": None, "duration_s": 60}]
+            monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda channel, **kw: (videos, "scrapecreators"))
+            monkeypatch.setattr(kb.ingest, "ingest_source", lambda *a, **kw: {"status": "done"})
+            memobase_cfg = kb.config.get_memobase_config_readonly()
+            result = kb.youtube.ingest_channel(conn, row, "https://www.youtube.com/@x", memobase_cfg=memobase_cfg, confirm=True)
+            assert result["per_video"][0]["reason"] is None
+        finally:
+            conn.close()
+
+    def test_per_video_carries_transcript_provider_and_cost(self, kb, monkeypatch):
+        conn = kb.db.get_connection()
+        try:
+            row = self._channel(kb, conn, "ytprovcost")
+            videos = [{"video_id": "ok1", "url": "https://youtu.be/ok1", "title": "T",
+                       "published_at": None, "duration_s": 60}]
+            monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda channel, **kw: (videos, "scrapecreators"))
+
+            def fake_ingest_source(conn_, collection_row, source, source_type, **kw):
+                return {"status": "done", "transcript_provider": "apify", "cost_estimate_usd": 0.0012}
+
+            monkeypatch.setattr(kb.ingest, "ingest_source", fake_ingest_source)
+            memobase_cfg = kb.config.get_memobase_config_readonly()
+            result = kb.youtube.ingest_channel(conn, row, "https://www.youtube.com/@x", memobase_cfg=memobase_cfg, confirm=True)
+            assert result["per_video"][0]["transcript_provider"] == "apify"
+            assert result["per_video"][0]["cost_estimate_usd"] == 0.0012
+            assert result["total_cost_estimate_usd"] == 0.0012
+        finally:
+            conn.close()
+
+    def test_total_cost_sums_across_videos_and_ignores_falsy(self, kb, monkeypatch):
+        conn = kb.db.get_connection()
+        try:
+            row = self._channel(kb, conn, "ytcostsum")
+            videos = [
+                {"video_id": f"v{i}", "url": f"https://youtu.be/v{i}", "title": "T",
+                 "published_at": None, "duration_s": 60}
+                for i in range(3)
+            ]
+            monkeypatch.setattr(kb.youtube, "list_channel_videos", lambda channel, **kw: (videos, "scrapecreators"))
+
+            costs = iter([0.001, None, 0.002])  # a failed/unchanged video has no cost -> None
+
+            def fake_ingest_source(conn_, collection_row, source, source_type, **kw):
+                return {"status": "done", "cost_estimate_usd": next(costs)}
+
+            monkeypatch.setattr(kb.ingest, "ingest_source", fake_ingest_source)
+            memobase_cfg = kb.config.get_memobase_config_readonly()
+            result = kb.youtube.ingest_channel(conn, row, "https://www.youtube.com/@x", memobase_cfg=memobase_cfg, confirm=True)
+            assert result["total_cost_estimate_usd"] == 0.003
+        finally:
+            conn.close()
+
+    def test_formatter_shows_reason_for_failed_and_provider_for_done(self, kb):
+        text = kb.tools._format_multi_item_result(
+            {
+                "status": "done", "video_count": 2, "videos_done": 1, "videos_unchanged": 0,
+                "videos_failed": 1, "list_provider": "scrapecreators", "total_cost_estimate_usd": 0.0025,
+                "per_video": [
+                    {"video_id": "ok1", "status": "done", "title": "Хорошее", "transcript_provider": "scrapecreators"},
+                    {"video_id": "bad", "status": "failed", "title": "Плохое", "reason": "HTTP 402: no credits"},
+                ],
+            },
+            name="c", kind="канала",
+        )
+        assert "HTTP 402" in text
+        assert "[scrapecreators]" in text
+        assert "0.0025" in text
+
+    def test_formatter_caps_long_reason(self, kb):
+        text = kb.tools._format_multi_item_result(
+            {
+                "status": "done", "video_count": 1, "videos_done": 0, "videos_unchanged": 0,
+                "videos_failed": 1, "list_provider": "scrapecreators",
+                "per_video": [{"video_id": "bad", "status": "failed", "title": "T", "reason": "x" * 500}],
+            },
+            name="c", kind="канала",
+        )
+        assert len(text) < 400
 
 
 # ===========================================================================
@@ -389,6 +616,140 @@ class TestSttOrchestrationFallback:
         # cleanup; an explicit path-existence check would require capturing
         # the internal tmp path, which the function deliberately doesn't
         # expose (see its docstring: caller does not own internal temp paths).
+
+
+class TestSttErrorMessagesCompact:
+    """Fix C: a provider's raw HTTP response body (often JSON, up to
+    hundreds of chars) must never reach a user-facing exception message --
+    only a short 'HTTP <code>' summary; the full body goes to the debug log
+    only."""
+
+    def test_groq_http_error_message_has_no_raw_body(self, kb, monkeypatch, tmp_path, caplog):
+        audio_path = tmp_path / "a.flac"
+        audio_path.write_bytes(b"not real audio, just needs bytes on disk")
+        monkeypatch.setenv("GROQ_API_KEY", "fake-key-for-test")
+
+        huge_body = '{"error": "' + ("x" * 800) + '"}'
+
+        class FakeResp:
+            status_code = 400
+            text = huge_body
+
+        monkeypatch.setattr(kb.stt, "_request_with_backoff", lambda *a, **k: FakeResp())
+        caplog.set_level(logging.DEBUG, logger="memobase.stt")
+
+        with pytest.raises(kb.stt.SttError) as exc_info:
+            kb.stt.transcribe_groq(str(audio_path))
+
+        message = str(exc_info.value)
+        assert huge_body not in message
+        assert "HTTP 400" in message
+        assert len(message) < 100
+        assert huge_body in caplog.text  # full body still reached the debug log
+
+    def test_gemini_http_error_message_has_no_raw_body(self, kb, monkeypatch, tmp_path, caplog):
+        audio_path = tmp_path / "a.flac"
+        audio_path.write_bytes(b"not real audio, just needs bytes on disk")
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+
+        huge_body = '{"error": "' + ("y" * 800) + '"}'
+
+        class FakeResp:
+            status_code = 503
+            text = huge_body
+
+        monkeypatch.setattr(kb.stt, "_request_with_backoff", lambda *a, **k: FakeResp())
+        caplog.set_level(logging.DEBUG, logger="memobase.stt")
+
+        with pytest.raises(kb.stt.SttError) as exc_info:
+            kb.stt.transcribe_gemini(str(audio_path))
+
+        message = str(exc_info.value)
+        assert huge_body not in message
+        assert "HTTP 503" in message
+        assert len(message) < 100
+        assert huge_body in caplog.text
+
+
+class TestSttChunkCountDuration:
+    """Fix F: transcribe_long_audio must return chunk_count/duration_s --
+    the data already existed (len(chunk_infos), _probe_duration_s), it was
+    just never returned. duration probing is best-effort (never fails an
+    otherwise-successful transcription)."""
+
+    def test_small_file_reports_chunk_count_one(self, kb, monkeypatch):
+        monkeypatch.setattr(kb.stt, "transcribe_groq", lambda path, **kw: [{"text": "ok", "start_sec": 0, "end_sec": 1}])
+        monkeypatch.setattr(kb.stt, "_safe_probe_duration_s", lambda path: 12.5)
+        result = kb.stt.transcribe_long_audio(b"fake bytes for a tiny fake audio file", filename_hint="clip.mp3", memobase_cfg={})
+        assert result["chunk_count"] == 1
+        assert result["duration_s"] == 12.5
+
+    def test_duration_probe_failure_is_none_not_fatal(self, kb, monkeypatch):
+        monkeypatch.setattr(kb.stt, "transcribe_groq", lambda path, **kw: [{"text": "ok", "start_sec": 0, "end_sec": 1}])
+
+        def boom(path):
+            raise kb.stt.SttError("ffmpeg not found")
+
+        monkeypatch.setattr(kb.stt, "_probe_duration_s", boom)
+        result = kb.stt.transcribe_long_audio(b"fake bytes for a tiny fake audio file", filename_hint="clip.mp3", memobase_cfg={})
+        assert result["duration_s"] is None
+        assert result["chunk_count"] == 1  # transcription itself still succeeds
+
+    def test_chunked_path_reports_real_chunk_count(self, kb, monkeypatch, tmp_path):
+        # A real >25MB file so the size check routes into the chunk ladder;
+        # chunk_audio_file itself is mocked out (no real ffmpeg needed).
+        audio_path = tmp_path / "big.flac"
+        audio_path.write_bytes(b"0" * (kb.stt.GROQ_MAX_BYTES + 1))
+
+        monkeypatch.setattr(kb.stt, "_safe_probe_duration_s", lambda path: 3600.0)
+        fake_chunks = [(str(tmp_path / f"c{i}.flac"), float(i * 100)) for i in range(3)]
+        monkeypatch.setattr(kb.stt, "chunk_audio_file", lambda path, **kw: fake_chunks)
+        monkeypatch.setattr(kb.stt, "transcribe_groq", lambda path, **kw: [{"text": f"seg-{path}", "start_sec": 0, "end_sec": 1}])
+
+        result = kb.stt.transcribe_long_audio(str(audio_path), memobase_cfg={"stt": {"preset": "groq"}})
+        assert result["chunk_count"] == 3
+        assert result["duration_s"] == 3600.0
+
+    def test_gemini_fallback_reports_chunk_count_one(self, kb, monkeypatch, tmp_path):
+        audio_path = tmp_path / "a.flac"
+        audio_path.write_bytes(b"not real audio, just needs a size")
+        monkeypatch.setattr(kb.stt, "_safe_probe_duration_s", lambda path: 42.0)
+
+        def groq_fails(path, **kw):
+            raise kb.stt.SttError("simulated Groq quota exceeded")
+
+        monkeypatch.setattr(kb.stt, "transcribe_groq", groq_fails)
+        monkeypatch.setattr(kb.stt, "transcribe_gemini", lambda path: [{"text": "g", "start_sec": 0, "end_sec": None}])
+        result = kb.stt.transcribe_long_audio(str(audio_path), memobase_cfg={"stt": {"preset": "groq"}})
+        assert result["provider"] == "gemini"
+        assert result["chunk_count"] == 1
+        assert result["duration_s"] == 42.0
+
+    def test_safe_probe_duration_wraps_error_as_none(self, kb, monkeypatch):
+        def boom(path):
+            raise kb.stt.SttError("no ffmpeg")
+
+        monkeypatch.setattr(kb.stt, "_probe_duration_s", boom)
+        assert kb.stt._safe_probe_duration_s("whatever") is None
+
+    def test_safe_probe_duration_passes_through_success(self, kb, monkeypatch):
+        monkeypatch.setattr(kb.stt, "_probe_duration_s", lambda path: 99.5)
+        assert kb.stt._safe_probe_duration_s("whatever") == 99.5
+
+    def test_extract_media_threads_chunk_count_and_duration_into_meta(self, kb, monkeypatch, tmp_path):
+        audio_path = tmp_path / "clip.mp3"
+        audio_path.write_bytes(b"fake mp3 bytes")
+        monkeypatch.setattr(
+            kb.stt, "transcribe_long_audio",
+            lambda audio, **kw: {
+                "segments": [{"text": "hi", "start_sec": 0.0, "end_sec": 1.0}],
+                "provider": "groq", "trust": "high", "low_confidence_boundaries": [],
+                "chunk_count": 4, "duration_s": 725.0,
+            },
+        )
+        doc = kb.stt.extract_media(str(audio_path), source_type="audio", memobase_cfg={})
+        assert doc["meta"]["chunk_count"] == 4
+        assert doc["meta"]["duration_s"] == 725.0
 
 
 # ===========================================================================
@@ -637,6 +998,36 @@ class TestIngestSourceDispatch:
         finally:
             conn.close()
 
+    def test_youtube_meta_hint_sets_document_title(self, kb, monkeypatch):
+        """Fix A's literal required smoke test: ingest_source(..., meta_hint=
+        {"title": ...}) for a youtube source must land in documents.title,
+        not the bare video id (the pre-fix behavior)."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        monkeypatch.setattr(
+            kb.youtube, "get_transcript",
+            lambda video_id, **kw: (
+                [{"text": "video transcript text here for testing purposes", "start_sec": 0.0, "end_sec": 1.0}],
+                "scrapecreators",
+            ),
+        )
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "ytmetahint", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            result = kb.ingest.ingest_source(
+                conn, row, "https://youtu.be/dQw4w9WgXcQ", "youtube",
+                memobase_cfg=kb.config.get_memobase_config_readonly(),
+                meta_hint={"title": "Человеческое Название Видео"},
+            )
+            assert result["status"] == "done"
+            doc_row = conn.execute(
+                "SELECT title FROM documents WHERE id = ?", (result["document_id"],)
+            ).fetchone()
+            assert doc_row["title"] == "Человеческое Название Видео"
+            assert doc_row["title"] != "dQw4w9WgXcQ"
+        finally:
+            conn.close()
+
     def test_obsidian_source_type_routes_to_obsidian_module(self, kb, monkeypatch, tmp_path):
         monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
         note = tmp_path / "note.md"
@@ -665,6 +1056,97 @@ class TestIngestSourceDispatch:
             row = kb.db.get_collection_by_id(conn, cid)
             result = kb.ingest.ingest_source(conn, row, str(audio_path), "audio", memobase_cfg=kb.config.get_memobase_config_readonly())
             assert result["status"] == "done"
+        finally:
+            conn.close()
+
+    def test_audio_source_result_carries_stt_chunk_count_and_duration(self, kb, monkeypatch, tmp_path):
+        """Fix F: chunk_count/duration_s are renamed stt_chunk_count/
+        stt_duration_s in ingest_source's result to avoid colliding with
+        this SAME dict's chunks_added/chunks_reused/... family, which count
+        TEXT chunks -- a different thing from audio chunks."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        audio_path = tmp_path / "clip.mp3"
+        audio_path.write_bytes(b"not real audio bytes")
+
+        monkeypatch.setattr(
+            kb.stt, "transcribe_long_audio",
+            lambda audio, **kw: {
+                "segments": [{"text": "audio transcript content for the test", "start_sec": 0, "end_sec": 1}],
+                "provider": "groq", "trust": "high", "low_confidence_boundaries": [],
+                "chunk_count": 2, "duration_s": 611.0,
+            },
+        )
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "audiochunkcount", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            result = kb.ingest.ingest_source(conn, row, str(audio_path), "audio", memobase_cfg=kb.config.get_memobase_config_readonly())
+            assert result["status"] == "done"
+            assert result["stt_chunk_count"] == 2
+            assert result["stt_duration_s"] == 611.0
+            assert result["transcript_provider"] == "groq"  # sourced from meta["stt_provider"]
+        finally:
+            conn.close()
+
+    def test_youtube_source_result_carries_transcript_provider(self, kb, monkeypatch, tmp_path):
+        """Fix E: build_video_doc already puts the winning provider in
+        doc["meta"]["transcript_provider"] -- it just never reached the
+        ingest_source result before."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+
+        def fake_extract_video(source, **kw):
+            return {
+                "text": "video transcript text here for testing purposes",
+                "blocks": [{"text": "video transcript text here for testing purposes", "page": "?t=0s", "section": "T", "is_code": False}],
+                "meta": {"title": "T", "video_id": "v1", "transcript_provider": "apify"},
+                "skipped": [],
+            }
+
+        monkeypatch.setattr(kb.youtube, "extract_video", fake_extract_video)
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "ytprovresult", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            result = kb.ingest.ingest_source(conn, row, "https://youtu.be/dQw4w9WgXcQ", "youtube", memobase_cfg=kb.config.get_memobase_config_readonly())
+            assert result["status"] == "done"
+            assert result["transcript_provider"] == "apify"
+            assert result["stt_chunk_count"] is None  # not an STT source -- no audio-chunking concept here
+        finally:
+            conn.close()
+
+    def test_done_result_carries_cost_estimate_matching_ledger(self, kb, monkeypatch, tmp_path):
+        """Fix G: cost_estimate_usd in the 'done' result must be the SAME
+        figure already recorded to the spend ledger for this call, not a
+        second, possibly-diverging computation."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc.txt"
+        p.write_text("Абзац с текстом для проверки оценки стоимости загрузки. " * 20, encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "costcoll", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            result = kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly())
+            assert result["status"] == "done"
+            assert result["cost_estimate_usd"] > 0
+            assert result["cost_estimate_usd"] == round(kb.db.monthly_spend(conn, "cloudflare"), 6)
+        finally:
+            conn.close()
+
+    def test_unchanged_result_has_no_cost_field(self, kb, monkeypatch, tmp_path):
+        """Fix G is scoped to the 'done' result only -- 'unchanged' means no
+        embed call happened at all, so there is nothing to report."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc2.txt"
+        p.write_text("Текст без изменений для проверки повторной загрузки.", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "costcoll2", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            cfg = kb.config.get_memobase_config_readonly()
+            kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=cfg)
+            result2 = kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=cfg)
+            assert result2["status"] == "unchanged"
+            assert "cost_estimate_usd" not in result2
         finally:
             conn.close()
 
@@ -724,6 +1206,119 @@ class TestToolsIngestionSourcesWiring:
         note.write_text("Одиночная заметка с уникальным текстом.", encoding="utf-8")
         result = kb.tools.memobase_ingest({"source": str(note), "source_type": "obsidian"})
         assert "Загружено в коллекцию" in result
+
+
+class TestToolsForceIngest:
+    """Fix H: memobase_ingest's `force` arg must reach ingest_source and
+    actually bypass the unchanged shortcut end-to-end through the tool
+    handler, not just the lower-level ingest_source() call."""
+
+    def test_schema_declares_force_param(self, kb):
+        props = kb.tools.MEMOBASE_INGEST_SCHEMA["parameters"]["properties"]
+        assert props["force"]["type"] == "boolean"
+
+    def test_force_arg_threads_through_tool_handler(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc.txt"
+        p.write_text("Текст документа без изменений для проверки force через тул.", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            kb.db.create_collection(conn, "forcecoll", embedder_dims=3)
+        finally:
+            conn.close()
+
+        out1 = kb.tools.memobase_ingest({"source": str(p), "source_type": "txt", "collection": "forcecoll"})
+        assert "Загружено" in out1
+
+        out2 = kb.tools.memobase_ingest({"source": str(p), "source_type": "txt", "collection": "forcecoll"})
+        assert "не изменился" in out2  # baseline: unchanged without force
+
+        out3 = kb.tools.memobase_ingest(
+            {"source": str(p), "source_type": "txt", "collection": "forcecoll", "force": True}
+        )
+        assert "Загружено" in out3  # force bypasses the "unchanged" shortcut
+        assert "не изменился" not in out3
+
+    def test_force_defaults_to_false(self, kb, monkeypatch, tmp_path):
+        """No `force` key at all must behave exactly like force=False (the
+        pre-existing default `bool(args.get("force", False))` reads)."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc.txt"
+        p.write_text("Текст без force-параметра вовсе.", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            kb.db.create_collection(conn, "noforcecoll", embedder_dims=3)
+        finally:
+            conn.close()
+        kb.tools.memobase_ingest({"source": str(p), "source_type": "txt", "collection": "noforcecoll"})
+        out = kb.tools.memobase_ingest({"source": str(p), "source_type": "txt", "collection": "noforcecoll"})
+        assert "не изменился" in out
+
+
+class TestToolsSingleIngestObservabilityFormatting:
+    """Fixes E/F/G: memobase_ingest's 'done' message for a single source
+    must show the transcript provider, STT chunk/duration stats, and the
+    cost estimate, whenever ingest_source's result actually carries them."""
+
+    def _default_collection(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            kb.db.create_collection(conn, kb.config.get_memobase_config_readonly()["default_collection"], embedder_dims=3)
+        finally:
+            conn.close()
+
+    def test_youtube_single_video_shows_transcript_provider(self, kb, monkeypatch):
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        monkeypatch.setattr(
+            kb.youtube, "get_transcript",
+            lambda video_id, **kw: (
+                [{"text": "текст видео для проверки форматтера", "start_sec": 0.0, "end_sec": 1.0}],
+                "apify",
+            ),
+        )
+        self._default_collection(kb)
+        out = kb.tools.memobase_ingest({"source": "https://youtu.be/dQw4w9WgXcQ", "source_type": "youtube"})
+        assert "Транскрипт: apify." in out
+
+    def test_audio_ingest_shows_chunk_count_and_duration(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        monkeypatch.setattr(
+            kb.stt, "transcribe_long_audio",
+            lambda audio, **kw: {
+                "segments": [{"text": "аудио для проверки форматтера длительности", "start_sec": 0, "end_sec": 1}],
+                "provider": "groq", "trust": "high", "low_confidence_boundaries": [],
+                "chunk_count": 3, "duration_s": 754.0,
+            },
+        )
+        audio_path = tmp_path / "clip.mp3"
+        audio_path.write_bytes(b"fake")
+        self._default_collection(kb)
+        out = kb.tools.memobase_ingest({"source": str(audio_path), "source_type": "audio"})
+        assert "Расшифровано аудио: 3 чанк(ов), 12:34." in out
+
+    def test_audio_ingest_shows_chunk_count_without_duration_when_probe_failed(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        monkeypatch.setattr(
+            kb.stt, "transcribe_long_audio",
+            lambda audio, **kw: {
+                "segments": [{"text": "аудио без известной длительности", "start_sec": 0, "end_sec": 1}],
+                "provider": "groq", "trust": "high", "low_confidence_boundaries": [],
+                "chunk_count": 1, "duration_s": None,
+            },
+        )
+        audio_path = tmp_path / "clip2.mp3"
+        audio_path.write_bytes(b"fake")
+        self._default_collection(kb)
+        out = kb.tools.memobase_ingest({"source": str(audio_path), "source_type": "audio"})
+        assert "Расшифровано аудио: 1 чанк(ов)." in out
+
+    def test_ingest_shows_cost_estimate(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc.txt"
+        p.write_text("Текст документа для проверки строки со стоимостью загрузки. " * 20, encoding="utf-8")
+        self._default_collection(kb)
+        out = kb.tools.memobase_ingest({"source": str(p), "source_type": "txt"})
+        assert "Оценка стоимости: $" in out
 
 
 # ===========================================================================

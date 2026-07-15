@@ -33,6 +33,10 @@ def _setup(subparser) -> None:
     p_status = sub.add_parser("status", help="Статус базы знаний")
     p_status.add_argument("--collection", default=None, help="Ограничить одной коллекцией")
 
+    p_list_docs = sub.add_parser("list-documents", help="Список документов внутри коллекции")
+    p_list_docs.add_argument("--collection", default=None, help="Имя коллекции (по умолчанию — привязанная/все видимые)")
+    p_list_docs.add_argument("--limit", type=int, default=None, help="Максимум документов на коллекцию (по умолчанию 50)")
+
     p_reindex = sub.add_parser(
         "reindex", help="Пере-эмбеддинг коллекции в теневую таблицу (после смены embedder в конфиге)"
     )
@@ -74,6 +78,31 @@ def _setup(subparser) -> None:
     p_backup = sub.add_parser("backup-run", help="Запустить ночной доктор вручную (снимок БД + ротация + диск)")
     p_backup.add_argument("--dir", default=None, help="Каталог для снимков (по умолчанию memobase/backups)")
 
+    # --- YOUTUBE (owner-only; enforced in tools.py's _require_privileged) --
+    p_youtube_list = sub.add_parser("youtube-list", help="Свежие видео YouTube-канала (только владелец)")
+    p_youtube_list.add_argument("channel", help="@handle, URL канала или ID (UC...)")
+    p_youtube_list.add_argument("--limit", type=int, default=None, help="Сколько видео вернуть (по умолчанию 30)")
+    p_youtube_list.add_argument("--since", default=None, help="Только видео не раньше даты, YYYY-MM-DD")
+    p_youtube_list.add_argument("--max-pages", type=int, default=None, dest="max_pages", help="Сколько страниц по 30 видео листать")
+
+    p_youtube_transcript = sub.add_parser("youtube-transcript", help="Таймкод-транскрипт видео по субтитрам (только владелец)")
+    p_youtube_transcript.add_argument("video", help="ID видео или ссылка")
+    p_youtube_transcript.add_argument("--language", default=None, help="Язык субтитров (по умолчанию ru)")
+    p_youtube_transcript.add_argument(
+        "--prefer-provider", default=None, dest="prefer_provider",
+        choices=["scrapecreators", "apify"], help="Какого провайдера пробовать первым",
+    )
+    p_youtube_transcript.add_argument("--max-segments", type=int, default=None, dest="max_segments", help="Обрезать вывод до N сегментов")
+    p_youtube_transcript.add_argument("--from-sec", type=float, default=None, dest="from_sec", help="Начало диапазона, сек")
+    p_youtube_transcript.add_argument("--to-sec", type=float, default=None, dest="to_sec", help="Конец диапазона, сек")
+    p_youtube_transcript.add_argument(
+        "--allow-audio-fallback", action="store_true", dest="allow_audio_fallback",
+        help="Если субтитров нет — платный audio+STT фолбэк",
+    )
+
+    p_youtube_audio = sub.add_parser("youtube-audio", help="Скачать аудио и распознать через STT (платно, только владелец)")
+    p_youtube_audio.add_argument("video", help="ID видео или ссылка")
+
     sub.add_parser("setup", help="Интерактивный мастер настройки (эмбеддинги/ключи/Obsidian/первая загрузка)")
 
 
@@ -100,6 +129,13 @@ def _handle(args) -> None:
     if sub == "status":
         status_args = {"collection": args.collection} if args.collection else {}
         print(tools.memobase_status(status_args, session_id=None))
+        return
+
+    if sub == "list-documents":
+        ld_args = {"collection": args.collection} if args.collection else {}
+        if args.limit is not None:
+            ld_args["limit"] = args.limit
+        print(tools.memobase_list_documents(ld_args, session_id=None))
         return
 
     if sub == "reindex":
@@ -175,6 +211,28 @@ def _handle(args) -> None:
         print(backup_mod.format_report(result))
         return
 
+    if sub == "youtube-list":
+        tool_args = {"channel": args.channel}
+        for key in ("limit", "since", "max_pages"):
+            if getattr(args, key, None) is not None:
+                tool_args[key] = getattr(args, key)
+        print(tools.memobase_youtube_list_channel(tool_args, session_id=None))
+        return
+
+    if sub == "youtube-transcript":
+        tool_args = {"video": args.video}
+        for key in ("language", "prefer_provider", "max_segments", "from_sec", "to_sec"):
+            if getattr(args, key, None) is not None:
+                tool_args[key] = getattr(args, key)
+        if getattr(args, "allow_audio_fallback", False):
+            tool_args["allow_audio_fallback"] = True
+        print(tools.memobase_youtube_get_transcript(tool_args, session_id=None))
+        return
+
+    if sub == "youtube-audio":
+        print(tools.memobase_youtube_dl_audio({"video": args.video}, session_id=None))
+        return
+
     if sub == "setup":
         _run_cli_setup_wizard()
         return
@@ -247,7 +305,7 @@ def _run_cli_setup_wizard() -> None:
                 if ok:
                     setup_core.write_env_secret(env_var, key)
                     _ok_live, msg = setup_core.validate_provider_key(provider)
-                    print(f"Ключ ({setup_core.mask_secret(key)}) сохранён — {msg}")
+                    print(f"Ключ ({setup_core.mask_secret(key)}) сохранён в {setup_core.env_file_path()} — {msg}")
                     break
                 print(hint)
                 if attempt == _MAX_ATTEMPTS:
@@ -259,6 +317,7 @@ def _run_cli_setup_wizard() -> None:
     print()
     print(setup_core.detect_obsidian_message())
     print("Готово. Дальше: `hermes memobase ingest <файл> <тип>`, `hermes memobase list`, `hermes memobase status`.")
+    print(f"Ключи записаны в {setup_core.env_file_path()}.")
     print(setup_core.restart_hint())
 
 

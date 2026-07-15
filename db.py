@@ -1127,6 +1127,56 @@ def collection_size_stats(conn: sqlite3.Connection, collection_id: int) -> Dict[
     return {"chunks": int(row["n"]), "approx_mb": float(row["bytes_sum"]) / (1024 * 1024)}
 
 
+def top_documents_by_chunks(conn, collection_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+    """Топ документов коллекции по числу ЖИВЫХ чанков — сводка для
+    memobase_status («что реально занимает коллекцию»)."""
+    rows = conn.execute(
+        """
+        SELECT d.id AS document_id, d.title, d.source_uri, COUNT(c.id) AS live_chunks
+        FROM documents d
+        JOIN chunks c ON c.document_id = d.id AND c.collection_id = d.collection_id
+             AND c.tombstoned_at IS NULL
+        WHERE d.collection_id = ?
+        GROUP BY d.id, d.title, d.source_uri
+        ORDER BY live_chunks DESC
+        LIMIT ?
+        """,
+        (collection_id, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_documents(conn, collection_id: int, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    """Все ЖИВЫЕ документы коллекции (не только топ-N) — данные для
+    memobase_list_documents («что внутри коллекции» без похода в sqlite
+    напрямую). "Живой" = хотя бы один нетомбстоуненный чанк; INNER JOIN
+    на chunks естественно исключает документы, у которых все чанки
+    протомбстоунены. Карантин сюда попасть не может в принципе — записи
+    quarantine становятся строками documents/chunks только ПОСЛЕ одобрения
+    (см. quarantine_insert/quarantine_review), до этого их тут просто нет.
+    ``d.superseded_at IS NULL`` — то же defense-in-depth исключение, что
+    retrieve.py's `_hydrate` делает при гидратации кандидатов поиска.
+
+    Сортировка: по объёму (live_chunks DESC), затем ``d.id`` как
+    детерминированный тай-брейк — без него порядок при равном live_chunks
+    не гарантирован, что ломало бы стабильную постраничную выдачу
+    (limit/offset)."""
+    rows = conn.execute(
+        """
+        SELECT d.id AS document_id, d.title, d.source_uri, COUNT(c.id) AS live_chunks
+        FROM documents d
+        JOIN chunks c ON c.document_id = d.id AND c.collection_id = d.collection_id
+             AND c.tombstoned_at IS NULL
+        WHERE d.collection_id = ? AND d.superseded_at IS NULL
+        GROUP BY d.id, d.title, d.source_uri
+        ORDER BY live_chunks DESC, d.id ASC
+        LIMIT ? OFFSET ?
+        """,
+        (collection_id, int(limit), int(offset)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # MULTIUSER: guest-upload quarantine (owner review queue)
 # ---------------------------------------------------------------------------
