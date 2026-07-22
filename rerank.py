@@ -44,6 +44,8 @@ DOCS_PER_SEARCH_UNIT = 100
 MAX_DOC_CHARS = 6000
 
 COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
+DASHSCOPE_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+DEFAULT_DASHSCOPE_MODEL = "gte-rerank-v2"
 
 
 class RerankError(RuntimeError):
@@ -85,6 +87,30 @@ def _cohere_rerank(query: str, documents: List[str], *, model: str, api_key: str
     results = payload.get("results")
     if not isinstance(results, list):
         raise RerankError(f"Cohere rerank response missing results[]: {str(payload)[:500]}")
+
+def _dashscope_rerank(query: str, documents: List[str], *, model: str, api_key: str) -> List[Dict[str, Any]]:
+    """DashScope gte-rerank endpoint. Returns the same ``[{"index",
+    "relevance_score"}, ...]`` shape as Cohere so downstream reorder logic is
+    provider-agnostic. Verified 2026-07-22: gte-rerank-v2 live call OK."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "input": {"query": query, "documents": documents},
+        "parameters": {"top_n": len(documents), "return_documents": False},
+    }
+    resp = embed_mod._request_with_backoff(
+        "POST", DASHSCOPE_RERANK_URL, headers=headers, json_body=body,
+        timeout=DEFAULT_TIMEOUT_S, max_retries=MAX_RETRIES,
+    )
+    if resp.status_code != 200:
+        raise RerankError(f"DashScope rerank HTTP {resp.status_code}: {resp.text[:500]}")
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise RerankError(f"DashScope rerank response was not JSON: {exc}") from exc
+    results = (payload.get("output") or {}).get("results")
+    if not isinstance(results, list):
+        raise RerankError(f"DashScope rerank response missing output.results: {str(payload)[:500]}")
     return results
 
 
@@ -118,38 +144,44 @@ def rerank(
         return candidates, "rrf-only"
 
     provider = (rerank_cfg.get("provider") or "cohere").lower()
-    if provider != "cohere":
+    if provider not in ("cohere", "dashscope"):
         logger.warning("rerank: unsupported provider %r configured; degrading to rrf-only", provider)
         return candidates, "rrf-only"
 
-    api_key = os.environ.get("COHERE_API_KEY")
+    if provider == "cohere":
+        api_key = os.environ.get("COHERE_API_KEY")
+    else:
+        api_key = os.environ.get(rerank_cfg.get("api_key_env", "DASHSCOPE_API_KEY"))
     if not api_key:
-        logger.info("rerank: COHERE_API_KEY not set; degrading to rrf-only")
+        logger.info("rerank: API key for %r not set; degrading to rrf-only", provider)
         return candidates, "rrf-only"
 
     if conn is not None:
         try:
-            ledger.ensure_within_ceiling(conn, "cohere", cfg)
+            ledger.ensure_within_ceiling(conn, provider, cfg)
         except ledger.LedgerError as exc:
             logger.info("rerank: %s; degrading to rrf-only", exc)
             return candidates, "rrf-only"
 
-    model = rerank_cfg.get("model") or DEFAULT_MODEL
+    model = rerank_cfg.get("model") or (DEFAULT_MODEL if provider == "cohere" else DEFAULT_DASHSCOPE_MODEL)
     documents = [c.get("text") or "" for c in candidates]
 
     try:
-        results = _cohere_rerank(query, documents, model=model, api_key=api_key)
+        if provider == "dashscope":
+            results = _dashscope_rerank(query, documents, model=model, api_key=api_key)
+        else:
+            results = _cohere_rerank(query, documents, model=model, api_key=api_key)
     except RerankError as exc:
-        logger.warning("rerank: Cohere call failed (%s); degrading to rrf-only", exc)
+        logger.warning("rerank: %s call failed (%s); degrading to rrf-only", provider, exc)
         return candidates, "rrf-only"
     except Exception:  # noqa: BLE001 - any unexpected shape/network error must degrade, not crash retrieval
-        logger.warning("rerank: unexpected error calling Cohere; degrading to rrf-only", exc_info=True)
+        logger.warning("rerank: unexpected error calling %s; degrading to rrf-only", provider, exc_info=True)
         return candidates, "rrf-only"
 
     if conn is not None:
         search_units = max(1, -(-len(candidates) // DOCS_PER_SEARCH_UNIT))  # ceil division
         try:
-            ledger.record_call(conn, provider="cohere", op="rerank", units=search_units, collection_id=collection_id)
+            ledger.record_call(conn, provider=provider, op="rerank", units=search_units, collection_id=collection_id)
         except Exception:  # noqa: BLE001 - ledger bookkeeping must never break a successful rerank result
             logger.error("rerank: failed to record ledger spend", exc_info=True)
 
@@ -174,4 +206,4 @@ def rerank(
                 item.setdefault("rerank_score", 0.0)
                 ranked.append(item)
 
-    return ranked, "cohere"
+    return ranked, provider

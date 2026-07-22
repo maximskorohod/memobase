@@ -200,6 +200,39 @@ def _embed_openai_compat(
     return all_vectors
 
 
+def _embed_ark_multimodal(
+    texts: List[str], *, base_url: str, model: str, api_key: Optional[str]
+) -> List[List[float]]:
+    """Volcengine ARK multimodal embedding (doubao-embedding-vision-*).
+
+    Unlike the OpenAI batch embeddings API, ARK's multimodal endpoint treats
+    the input array as multiple modality parts of ONE document — so texts
+    must be sent one per request. Response shape:
+    ``{"data": {"embedding": [...]}, "usage": {...}}``.
+    Verified 2026-07-22: doubao-embedding-vision-251215 returns 2048 dims.
+    """
+    url = base_url.rstrip("/") + "/embeddings/multimodal"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    all_vectors: List[List[float]] = []
+    for text in texts:
+        body = {"model": model, "input": [{"type": "text", "text": text}]}
+        resp = _request_with_backoff("POST", url, headers=headers, json_body=body)
+        if resp.status_code != 200:
+            raise EmbedError(f"ARK multimodal embed call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise EmbedError(f"ARK multimodal embed response was not JSON: {exc}") from exc
+        vec = (payload.get("data") or {}).get("embedding")
+        if not isinstance(vec, list):
+            raise EmbedError(f"ARK multimodal embed response missing data.embedding: {str(payload)[:500]}")
+        all_vectors.append(vec)
+    return all_vectors
+
+
 # ---------------------------------------------------------------------------
 # Local provider (fastembed / ONNX Runtime — NO PyTorch). Opt-in alternative
 # to Cloudflare: downloads a quantized ONNX model once, then runs on CPU, so
@@ -302,6 +335,13 @@ def embed_texts(
         api_key_env = embedder.get("api_key_env", "OPENAI_API_KEY")
         api_key = embedder.get("api_key") or os.environ.get(api_key_env)
         vectors = _embed_openai_compat(texts, base_url=base_url, model=model, api_key=api_key)
+    elif provider in ("ark-multimodal", "ark_multimodal"):
+        base_url = embedder.get("base_url")
+        if not base_url:
+            raise EmbedError("ark-multimodal embedder requires embedder.base_url in collection config")
+        api_key_env = embedder.get("api_key_env", "ARK_API_KEY")
+        api_key = embedder.get("api_key") or os.environ.get(api_key_env)
+        vectors = _embed_ark_multimodal(texts, base_url=base_url, model=model, api_key=api_key)
     else:
         raise EmbedError(f"unknown embedder provider: {provider!r}")
 
