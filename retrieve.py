@@ -57,6 +57,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -266,7 +267,7 @@ def _hydrate(conn: sqlite3.Connection, chunk_ids_in_order: List[int]) -> Dict[in
     rows = conn.execute(
         f"""
         SELECT c.id AS chunk_id, c.text, c.page_or_timecode, c.section, c.lang,
-               c.document_id, c.tombstoned_at,
+               c.document_id, c.tombstoned_at, c.created_at AS chunk_created_at,
                d.source_uri, d.title, d.superseded_at
         FROM chunks c
         JOIN documents d ON d.id = c.document_id
@@ -363,7 +364,7 @@ def hybrid_search(
 
     ranked, mode = rerank_mod.rerank(query, rerank_candidates, cfg, conn=conn, collection_id=collection_id)
 
-    if mode == "cohere":
+    if mode in ("cohere", "dashscope"):
         rrf_scores = [c["rrf_score"] for c in ranked]
         norm_rrf = dict(zip((c["chunk_id"] for c in ranked), _min_max_normalize(rrf_scores)))
         for c in ranked:
@@ -389,6 +390,20 @@ def hybrid_search(
             "score": fused[cid]["score"],
             "source": fused[cid]["source"],
         })
+
+    # Time decay: score *= 0.5 ** (age_days / half_life_days) so fresher
+    # chunks outrank stale ones. Disabled when half_life <= 0 (default).
+    # Config: memobase.retrieve.time_decay_half_life_days in config.yaml.
+    retr_cfg = cfg.get("retrieve") or {}
+    half_life = float(retr_cfg.get("time_decay_half_life_days") or 0)
+    if half_life > 0:
+        now_ts = time.time()
+        for c in ranked:
+            created = hydrated.get(c["chunk_id"], {}).get("chunk_created_at")
+            if created:
+                age_days = max(0.0, (now_ts - float(created)) / 86400.0)
+                c["score"] *= 0.5 ** (age_days / half_life)
+        ranked.sort(key=lambda c: c["score"], reverse=True)
 
     results: List[Dict[str, Any]] = []
     for c in ranked[:k]:
