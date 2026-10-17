@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import ledger
 from .secrets import get_env
 from .security import DEFAULT_USER_AGENT, describe_request_error
 
@@ -465,6 +466,12 @@ def _safe_probe_duration_s(path: str) -> Optional[float]:
         return None
 
 
+def _note_stt(provider: str, duration_s: Optional[float], size_bytes: int) -> None:
+    # Unknown duration (no ffprobe): estimate from size at ~128 kbit/s.
+    seconds = duration_s if duration_s else size_bytes / 16000.0
+    ledger.note_external_call(provider, "stt", seconds)
+
+
 def transcribe_long_audio(
     audio: "bytes | str", *, filename_hint: str = "audio", memobase_cfg: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -515,6 +522,7 @@ def transcribe_long_audio(
             try:
                 if size <= GROQ_MAX_BYTES:
                     segments = transcribe_groq(input_path, filename=os.path.basename(filename_hint))
+                    _note_stt("groq", duration_s, size)
                     return {
                         "segments": segments, "provider": "groq", "trust": "high",
                         "low_confidence_boundaries": [], "chunk_count": 1, "duration_s": duration_s,
@@ -525,6 +533,7 @@ def transcribe_long_audio(
                     segs = transcribe_groq(chunk_path, filename=os.path.basename(chunk_path))
                     chunk_results.append({"segments": segs, "offset_sec": offset})
                 merged = merge_chunk_transcripts(chunk_results)
+                _note_stt("groq", duration_s, size)
                 return {
                     "segments": merged["segments"], "provider": "groq", "trust": "high",
                     "low_confidence_boundaries": merged["low_confidence_boundaries"],
@@ -534,6 +543,7 @@ def transcribe_long_audio(
                 logger.warning("Groq STT failed (%s); falling back to Gemini", exc)
 
         segments = transcribe_gemini(input_path)
+        _note_stt("gemini", duration_s, size)
         return {
             "segments": segments, "provider": "gemini", "trust": "low",
             "low_confidence_boundaries": [], "chunk_count": 1, "duration_s": duration_s,

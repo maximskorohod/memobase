@@ -314,6 +314,9 @@ def hybrid_search(
     query: str,
     k: int,
     cfg: Dict[str, Any],
+    *,
+    user_id: Optional[str] = None,
+    memobase_cfg: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Return up to *k* fused, (optionally reranked+blended) candidates for
     *query* in *collection_id*. Never raises for ordinary degradation
@@ -323,6 +326,9 @@ def hybrid_search(
     *cfg* is the effective per-collection config (``config.get_collection_cfg``
     output) — needs ``embedder`` (for query embedding), ``rerank`` (for the
     reranker step), and ``migration_state``.
+
+    *user_id*: a GUEST identity (None for the owner) — the paid rerank call
+    is then checked against and charged to that guest's daily budget.
     """
     query = (query or "").strip()
     if not query or k <= 0:
@@ -361,7 +367,10 @@ def hybrid_search(
         for rank, cid in enumerate(rerank_input_ids, start=1)
     ]
 
-    ranked, mode = rerank_mod.rerank(query, rerank_candidates, cfg, conn=conn, collection_id=collection_id)
+    ranked, mode = rerank_mod.rerank(
+        query, rerank_candidates, cfg, conn=conn, collection_id=collection_id,
+        user_id=user_id, memobase_cfg=memobase_cfg,
+    )
 
     if mode == "cohere":
         rrf_scores = [c["rrf_score"] for c in ranked]

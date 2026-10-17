@@ -19,9 +19,11 @@ published pricing, not treated as billing-accurate.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import sqlite3
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from . import db
 
@@ -45,7 +47,16 @@ class LedgerError(RuntimeError):
 # documents), historically ~$2.00 / 1000 search units.
 _PRICING_USD: dict = {
     ("cloudflare", "embed"): 0.000012,   # $ per 1,000 approx-tokens
+    ("local", "embed"): 0.0,             # on-box fastembed: free (listed so no "no pricing" warning per call)
     ("cohere", "rerank"): 0.002,         # $ per rerank search-unit
+    # Apify actors (pay-per-result; same figures as youtube.estimate_channel_cost_usd)
+    ("apify", "channel_list"): 0.0005,   # $ per listed video
+    ("apify", "transcript"): 0.0005,     # $ per video transcript
+    ("apify", "audio_download"): 0.002,  # $ per audio minute
+    ("scrapecreators", "request"): 0.0,  # credit-based; recorded for visibility only
+    # STT, $ per second of audio
+    ("groq", "stt"): 0.04 / 3600.0,      # whisper-large-v3-turbo, $0.04/hour
+    ("gemini", "stt"): 0.00001,          # gemini-2.5-flash-lite audio input, ~32 tok/s
 }
 
 _DEFAULT_FALLBACK_PRICE = 0.0  # unknown (provider, op): estimate as free rather than guess wildly
@@ -94,8 +105,62 @@ def record_call(
     )
 
 
+# ---------------------------------------------------------------------------
+# External calls made deep inside extractors (Apify / ScrapeCreators / STT)
+# that have no DB connection of their own: they NOTE the call into a
+# per-context bucket, and the orchestrator holding `conn` (ingest_source,
+# ingest_channel, the raw YouTube tools) flushes it into `spend` with the
+# right collection_id/user_id.
+# ---------------------------------------------------------------------------
+
+_pending_spend: "contextvars.ContextVar[Optional[List[tuple]]]" = contextvars.ContextVar(
+    "memobase_pending_spend", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_external_spend():
+    """Collect :func:`note_external_call` notes made inside this block."""
+    bucket: List[tuple] = []
+    token = _pending_spend.set(bucket)
+    try:
+        yield bucket
+    finally:
+        _pending_spend.reset(token)
+
+
+def note_external_call(provider: str, op: str, units: float) -> None:
+    """Note one paid external call; recorded when the enclosing
+    :func:`collect_external_spend` block is flushed. Never raises."""
+    bucket = _pending_spend.get()
+    if bucket is None:
+        logger.debug("ledger: external call %s/%s outside a spend collector (not recorded)", provider, op)
+        return
+    try:
+        bucket.append((provider, op, max(0.0, float(units or 0.0))))
+    except (TypeError, ValueError):
+        bucket.append((provider, op, 0.0))
+
+
+def flush_external_spend(conn: sqlite3.Connection, bucket: List[tuple], *,
+                         collection_id: Optional[int] = None, user_id: Optional[str] = None) -> float:
+    """Record every noted call into ``spend``; returns the summed $ estimate.
+    Bookkeeping failures are logged, never raised."""
+    total = 0.0
+    while bucket:
+        provider, op, units = bucket.pop(0)
+        est = estimate_cost_usd(provider, op, units)
+        total += est
+        try:
+            record_call(conn, provider=provider, op=op, units=units, est_usd=est,
+                        collection_id=collection_id, user_id=user_id)
+        except Exception:  # noqa: BLE001
+            logger.error("ledger: failed to record %s/%s spend", provider, op, exc_info=True)
+    return total
+
+
 def check_monthly_ceiling(
-    conn: sqlite3.Connection, provider: str, memobase_cfg: dict
+    conn: sqlite3.Connection, provider: str, memobase_cfg: dict, *, estimated_usd: float = 0.0
 ) -> Tuple[bool, float, float]:
     """Return ``(within_ceiling, spent_so_far_usd, ceiling_usd)`` for
     *provider* over the trailing 30 days, per ``memobase.monthly_ceiling_usd.<provider>``.
@@ -110,19 +175,24 @@ def check_monthly_ceiling(
     if ceiling is None:
         return True, spent, float("inf")
     ceiling = float(ceiling)
-    return (spent < ceiling), spent, ceiling
+    estimated = max(0.0, float(estimated_usd or 0.0))
+    # spent + estimated: a job that would push spend over the ceiling is
+    # refused up front, not only the one after the ceiling was crossed.
+    within = spent < ceiling and (spent + estimated) <= ceiling
+    return within, spent, ceiling
 
 
-def ensure_within_ceiling(conn: sqlite3.Connection, provider: str, memobase_cfg: dict) -> None:
+def ensure_within_ceiling(conn: sqlite3.Connection, provider: str, memobase_cfg: dict, *,
+                          estimated_usd: float = 0.0) -> None:
     """Raise :class:`LedgerError` if *provider*'s trailing-30-day spend has
     already reached/exceeded its configured monthly ceiling. Callers
     (ingest.py, before starting a costly embed/rerank job) should call this
     BEFORE spending more, not after — it does not itself prevent the
     in-flight call that triggered it from completing.
     """
-    within, spent, ceiling = check_monthly_ceiling(conn, provider, memobase_cfg)
+    within, spent, ceiling = check_monthly_ceiling(conn, provider, memobase_cfg, estimated_usd=estimated_usd)
     if not within:
         raise LedgerError(
-            f"{provider} monthly spend ceiling reached: ${spent:.4f} spent >= ${ceiling:.4f} ceiling "
-            f"(memobase.monthly_ceiling_usd.{provider}); job refused"
+            f"{provider} monthly spend ceiling reached: ${spent:.4f} spent + ${estimated_usd:.4f} estimated "
+            f"> ${ceiling:.4f} ceiling (memobase.monthly_ceiling_usd.{provider}); job refused"
         )

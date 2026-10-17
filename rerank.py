@@ -29,8 +29,10 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import db
 from . import embed as embed_mod
 from . import ledger
+from . import security
 from .secrets import get_env
 
 logger = logging.getLogger("memobase.rerank")
@@ -90,6 +92,23 @@ def _cohere_rerank(query: str, documents: List[str], *, model: str, api_key: str
     return results
 
 
+def _guest_budget_allows(conn: Any, user_id: str, estimated_usd: float,
+                         memobase_cfg: Optional[Dict[str, Any]]) -> bool:
+    """A guest's rerank is paid from their daily $ budget — checked BEFORE
+    the call (degrade to rrf-only when it would not fit)."""
+    try:
+        if memobase_cfg is None:
+            from . import config as kb_config
+
+            memobase_cfg = kb_config.get_memobase_config_readonly()
+        quota = security.effective_guest_quota(memobase_cfg, db.get_guest_quota(conn, user_id))
+        used = db.get_guest_usage_today(conn, user_id)["usd_spent"]
+        return security.check_daily_budget_quota(quota, used_usd_today=used, estimated_usd=estimated_usd).ok
+    except Exception:  # noqa: BLE001 - cannot verify the budget => do not spend
+        logger.warning("rerank: guest budget check failed; degrading to rrf-only", exc_info=True)
+        return False
+
+
 def rerank(
     query: str,
     candidates: List[Dict[str, Any]],
@@ -97,6 +116,8 @@ def rerank(
     *,
     conn: Any = None,
     collection_id: Optional[int] = None,
+    user_id: Optional[str] = None,
+    memobase_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Rerank *candidates* (each a dict with at least a ``"text"`` key —
     the fields produced by ``retrieve.hybrid_search``'s RRF fusion step)
@@ -129,11 +150,16 @@ def rerank(
         logger.info("rerank: COHERE_API_KEY not set; degrading to rrf-only")
         return candidates, "rrf-only"
 
+    search_units = max(1, -(-len(candidates) // DOCS_PER_SEARCH_UNIT))  # ceil division
+    estimated_usd = ledger.estimate_cost_usd("cohere", "rerank", search_units)
     if conn is not None:
         try:
-            ledger.ensure_within_ceiling(conn, "cohere", cfg)
+            ledger.ensure_within_ceiling(conn, "cohere", cfg, estimated_usd=estimated_usd)
         except ledger.LedgerError as exc:
             logger.info("rerank: %s; degrading to rrf-only", exc)
+            return candidates, "rrf-only"
+        if user_id is not None and not _guest_budget_allows(conn, user_id, estimated_usd, memobase_cfg):
+            logger.info("rerank: guest %s daily budget exhausted; degrading to rrf-only", user_id)
             return candidates, "rrf-only"
 
     model = rerank_cfg.get("model") or DEFAULT_MODEL
@@ -149,9 +175,13 @@ def rerank(
         return candidates, "rrf-only"
 
     if conn is not None:
-        search_units = max(1, -(-len(candidates) // DOCS_PER_SEARCH_UNIT))  # ceil division
         try:
-            ledger.record_call(conn, provider="cohere", op="rerank", units=search_units, collection_id=collection_id)
+            ledger.record_call(
+                conn, provider="cohere", op="rerank", units=search_units, est_usd=estimated_usd,
+                collection_id=collection_id, user_id=user_id,
+            )
+            if user_id is not None:
+                db.record_guest_usage(conn, user_id, usd_spent=estimated_usd)
         except Exception:  # noqa: BLE001 - ledger bookkeeping must never break a successful rerank result
             logger.error("rerank: failed to record ledger spend", exc_info=True)
 

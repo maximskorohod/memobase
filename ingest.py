@@ -311,7 +311,17 @@ def ingest_source(
         )
 
     # --- 1. Extract --------------------------------------------------------
-    doc = _extract_dispatch(source, source_type, memobase_cfg=memobase_cfg, meta_hint=meta_hint)
+    # Paid external calls inside the extractors (Apify / ScrapeCreators /
+    # STT) are noted into a bucket and recorded here, attributed to the
+    # uploader — whether or not extraction then produced usable text.
+    with ledger.collect_external_spend() as spend_bucket:
+        doc = _extract_dispatch(source, source_type, memobase_cfg=memobase_cfg, meta_hint=meta_hint)
+    external_cost_usd = ledger.flush_external_spend(
+        conn, spend_bucket, collection_id=collection_id, user_id=uploader_user_id,
+    )
+    if uploader_user_id is not None and external_cost_usd:
+        stt_seconds = float(((doc.get("meta") or {}).get("duration_s")) or 0.0)
+        db.record_guest_usage(conn, uploader_user_id, usd_spent=external_cost_usd, stt_seconds=stt_seconds)
     if not (doc.get("text") or "").strip():
         reasons = "; ".join(s.get("reason", "?") for s in doc.get("skipped", [])) or "no text extracted"
         return _fail(f"extraction produced no text: {reasons}", skipped=doc.get("skipped", []))
@@ -467,7 +477,10 @@ def ingest_source(
 
     provider = (collection_cfg["embedder"].get("provider") or "cloudflare").lower()
     try:
-        ledger.ensure_within_ceiling(conn, provider, memobase_cfg)
+        ledger.ensure_within_ceiling(
+            conn, provider, memobase_cfg,
+            estimated_usd=estimate_embed_cost_usd([c["text"] for _, c in to_embed], collection_cfg),
+        )
     except ledger.LedgerError as exc:
         return _fail(str(exc))
 
@@ -660,7 +673,8 @@ def ingest_source(
         "transcript_provider": meta.get("transcript_provider") or meta.get("stt_provider"),
         "stt_chunk_count": meta.get("chunk_count"),
         "stt_duration_s": meta.get("duration_s"),
-        "cost_estimate_usd": round(actual_embed_cost_usd, 6),
+        "cost_estimate_usd": round(actual_embed_cost_usd + external_cost_usd, 6),
+        "external_cost_usd": round(external_cost_usd, 6),
     }
 
 

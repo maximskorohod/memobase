@@ -361,6 +361,8 @@ def answer(
     *,
     llm: Any = None,
     k: int = DEFAULT_K,
+    user_id: Optional[str] = None,
+    memobase_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Produce a grounded, cited RU answer to *query* within
     *collection_id*, or an honest refusal. Never raises for ordinary
@@ -388,7 +390,9 @@ def answer(
             "refused": True, "degraded": True, "near_miss": False,
         }
 
-    candidates = retrieve_mod.hybrid_search(conn, collection_id, query, k, cfg)
+    candidates = retrieve_mod.hybrid_search(
+        conn, collection_id, query, k, cfg, user_id=user_id, memobase_cfg=memobase_cfg,
+    )
     if not candidates:
         return {
             "answer": f"В базе знаний «{collection_name}» пока нет ничего по этому вопросу.",

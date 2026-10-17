@@ -71,6 +71,9 @@ DEFAULTS: Dict[str, Any] = {
     "youtube": {
         "transcript_providers": ["scrapecreators", "apify"],
         "confirm_over_videos": 20,
+        # Hard cap per channel ingest (even with confirm) — bounds paid
+        # per-video transcript/STT runs from one call.
+        "max_videos": 200,
     },
     # STT preset (stt.py): "groq" (default, whisper-large-v3-turbo) or
     # "gemini" (gemini-2.5-flash-lite, used automatically as a fallback on

@@ -48,6 +48,7 @@ from . import answer as answer_mod
 from . import config as kb_config
 from . import db
 from . import ingest as ingest_mod
+from . import ledger
 from . import security
 from . import selfcheck as selfcheck_mod
 from . import setup_core
@@ -453,6 +454,11 @@ def _format_multi_item_result(result: Dict[str, Any], *, name: str, kind: str) -
         if result.get("total_cost_estimate_usd"):
             summary += f", оценка стоимости ${result['total_cost_estimate_usd']:.4f}"
         lines = [summary + "."]
+        if result.get("videos_capped"):
+            lines.append(
+                f"Список обрезан до {result.get('video_count')} из {result.get('videos_listed')} видео "
+                f"(memobase.youtube.max_videos)."
+            )
         per_video = result.get("per_video") or []
         if per_video:
             failed_first = sorted(per_video, key=lambda r: 0 if r.get("status") == "failed" else 1)
@@ -800,7 +806,10 @@ def memobase_query(args: Dict[str, Any], **kwargs: Any) -> str:
         if session_id and not get_session_binding(session_id):
             bind_session_collection(session_id, name)
         collection_cfg = kb_config.get_collection_cfg(row, memobase_cfg=memobase_cfg)
-        candidates = retrieve_mod.hybrid_search(conn, row["id"], query, k, collection_cfg)
+        guest_id = None if security.is_privileged(user_id, memobase_cfg) else user_id
+        candidates = retrieve_mod.hybrid_search(
+            conn, row["id"], query, k, collection_cfg, user_id=guest_id, memobase_cfg=memobase_cfg,
+        )
     finally:
         conn.close()
 
@@ -904,7 +913,10 @@ def memobase_ask(args: Dict[str, Any], **kwargs: Any) -> str:
         if session_id and not get_session_binding(session_id):
             bind_session_collection(session_id, name)
         collection_cfg = kb_config.get_collection_cfg(row, memobase_cfg=memobase_cfg)
-        result = answer_mod.answer(conn, row["id"], query, collection_cfg, llm=llm, k=k)
+        guest_id = None if security.is_privileged(user_id, memobase_cfg) else user_id
+        result = answer_mod.answer(
+            conn, row["id"], query, collection_cfg, llm=llm, k=k, user_id=guest_id, memobase_cfg=memobase_cfg,
+        )
     finally:
         conn.close()
 
@@ -1577,6 +1589,25 @@ def memobase_quarantine_review(args: Dict[str, Any], **kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _run_recording_spend(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run an owner-only raw YouTube/STT helper and record the paid
+    external calls it noted (Apify/ScrapeCreators/STT) into the ledger —
+    even when it raises. Bookkeeping never masks the real result."""
+    with ledger.collect_external_spend() as bucket:
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if bucket:
+                try:
+                    conn = db.get_connection()
+                    try:
+                        ledger.flush_external_spend(conn, bucket)
+                    finally:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    logger.error("memobase: failed to record external spend", exc_info=True)
+
+
 def _format_transcript_segments(segments: List[Dict[str, Any]]) -> str:
     """Render transcript/STT segments as timecoded ``[mm:ss] text`` lines —
     ready to drop back into MemoBase as ONE md document per video (the whole
@@ -1680,8 +1711,8 @@ def memobase_youtube_list_channel(args: Dict[str, Any], **kwargs: Any) -> str:
         max_pages = max(1, -(-limit // youtube_mod.SC_PAGE_SIZE))  # ceil(limit / page size)
 
     try:
-        raw_videos, provider = youtube_mod.list_channel_videos(
-            channel, memobase_cfg=memobase_cfg, max_pages=max_pages
+        raw_videos, provider = _run_recording_spend(
+            youtube_mod.list_channel_videos, channel, memobase_cfg=memobase_cfg, max_pages=max_pages
         )
     except youtube_mod.YoutubeError as exc:
         return f"Не удалось получить список видео канала «{channel}»: {exc}"
@@ -1773,7 +1804,9 @@ def memobase_youtube_get_transcript(args: Dict[str, Any], **kwargs: Any) -> str:
         cfg = {**memobase_cfg, "youtube": {**(memobase_cfg.get("youtube") or {}), "transcript_providers": order}}
 
     try:
-        segments, provider = youtube_mod.get_transcript(video_id, memobase_cfg=cfg, language=language)
+        segments, provider = _run_recording_spend(
+            youtube_mod.get_transcript, video_id, memobase_cfg=cfg, language=language
+        )
     except youtube_mod.YoutubeError as exc:
         return f"Не удалось получить субтитры видео {video_id}: все провайдеры недоступны ({exc})."
 
@@ -1781,7 +1814,7 @@ def memobase_youtube_get_transcript(args: Dict[str, Any], **kwargs: Any) -> str:
         if args.get("allow_audio_fallback"):
             return (
                 "Субтитров нет — выполняю платный audio+STT фолбэк.\n\n"
-                + _audio_stt_output(video_id, memobase_cfg)
+                + _run_recording_spend(_audio_stt_output, video_id, memobase_cfg)
             )
         return (
             f"У видео {video_id} нет субтитров ни у одного провайдера. "
@@ -1858,7 +1891,7 @@ def memobase_youtube_dl_audio(args: Dict[str, Any], **kwargs: Any) -> str:
     except youtube_mod.YoutubeError as exc:
         return str(exc)
 
-    return _audio_stt_output(video_id, memobase_cfg)
+    return _run_recording_spend(_audio_stt_output, video_id, memobase_cfg)
 
 
 # ---------------------------------------------------------------------------

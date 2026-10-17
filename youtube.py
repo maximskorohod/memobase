@@ -75,6 +75,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import ledger
 from .secrets import get_env
 from .security import DEFAULT_USER_AGENT, describe_request_error, safe_get
 
@@ -88,6 +89,7 @@ APIFY_TRANSCRIPT_ACTOR = "supreme_coder~youtube-transcript-scraper"
 APIFY_AUDIO_ACTOR = "lurkapi~youtube-to-mp3-audio-downloader"
 
 DEFAULT_TRANSCRIPT_PROVIDERS = ["scrapecreators", "apify"]
+DEFAULT_MAX_CHANNEL_VIDEOS = 200  # memobase.youtube.max_videos — hard cap per channel ingest
 SC_PAGE_SIZE = 30  # videos/page, per the live-verified probe
 
 DEFAULT_TIMEOUT_S = 30.0
@@ -235,6 +237,7 @@ def _sc_api_key() -> str:
 def _sc_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{SCRAPECREATORS_BASE}{path}"
     headers = {"x-api-key": _sc_api_key()}
+    ledger.note_external_call("scrapecreators", "request", 1)
     resp = _request_with_backoff("GET", url, headers=headers, params=params)
     if resp.status_code != 200:
         logger.debug("ScrapeCreators %s failed: HTTP %s body=%s", path, resp.status_code, resp.text[:300])
@@ -370,6 +373,7 @@ def _apify_run_actor(actor_id: str, run_input: Dict[str, Any], *, poll_interval_
 def channel_videos_apify(channel: str) -> List[Dict[str, Any]]:
     """Fallback channel listing via ``streamers/youtube-channel-scraper``."""
     items = _apify_run_actor(APIFY_CHANNEL_ACTOR, {"startUrls": [{"url": channel}]})
+    ledger.note_external_call("apify", "channel_list", len(items))
     videos: List[Dict[str, Any]] = []
     for it in items:
         vid = it.get("id") or it.get("videoId")
@@ -631,6 +635,7 @@ def transcript_apify(
         APIFY_TRANSCRIPT_ACTOR,
         {"urls": [video_watch_url(video_id)], "languages": [language]},
     )
+    ledger.note_external_call("apify", "transcript", 1)
     if not items:
         return None
     item = items[0]
@@ -722,6 +727,14 @@ def download_audio_apify(video_id: str) -> Tuple[bytes, str]:
     :class:`YoutubeError` on any failure — caller (:func:`extract_video`)
     treats that as a final, honest "could not transcribe" skip reason."""
     items = _apify_run_actor(APIFY_AUDIO_ACTOR, {"videoUrls": [video_watch_url(video_id)]})
+    if items:
+        try:
+            minutes = float(items[0].get("duration") or 0) / 60.0
+        except (TypeError, ValueError):
+            minutes = 0.0
+        # Duration unknown up front: charge the same 12-minute assumption the
+        # channel estimate uses.
+        ledger.note_external_call("apify", "audio_download", minutes or 12.0)
     if not items:
         raise YoutubeError(f"Apify audio actor returned no items for video {video_id}")
     item = items[0]
@@ -929,10 +942,24 @@ def ingest_channel(
     job_id = db.create_ingestion_job(conn, collection_id=collection_row["id"], kind="youtube_channel", stage="list")
 
     try:
-        videos, list_provider = list_channel_videos(channel, memobase_cfg=memobase_cfg)
+        with ledger.collect_external_spend() as spend_bucket:
+            try:
+                videos, list_provider = list_channel_videos(channel, memobase_cfg=memobase_cfg)
+            finally:
+                listing_usd = ledger.flush_external_spend(
+                    conn, spend_bucket, collection_id=collection_row["id"], user_id=uploader_user_id,
+                )
+                if uploader_user_id is not None and listing_usd:
+                    db.record_guest_usage(conn, uploader_user_id, usd_spent=listing_usd)
     except YoutubeError as exc:
         db.update_ingestion_job(conn, job_id, status="failed", stage="failed")
         return {"status": "failed", "error": f"could not list channel videos: {exc}", "job_id": job_id}
+
+    # Hard cap regardless of confirmation: one call can never enqueue an
+    # unbounded number of paid per-video transcript/STT runs.
+    max_videos = int((memobase_cfg.get("youtube") or {}).get("max_videos") or DEFAULT_MAX_CHANNEL_VIDEOS)
+    videos_total_listed = len(videos)
+    videos = videos[:max_videos]
 
     threshold = (memobase_cfg.get("youtube") or {}).get("confirm_over_videos", 20)
     if len(videos) > threshold and not confirm:
@@ -1003,6 +1030,8 @@ def ingest_channel(
         "job_id": job_id,
         "list_provider": list_provider,
         "video_count": len(videos),
+        "videos_listed": videos_total_listed,
+        "videos_capped": videos_total_listed > len(videos),
         "videos_done": counts.get("done", 0),
         "videos_unchanged": counts.get("unchanged", 0),
         "videos_failed": counts.get("failed", 0),
