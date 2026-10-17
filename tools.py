@@ -709,6 +709,11 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
                 f"Внимание: {result['chunks_quarantined_injection']} фрагмент(ов) этой гостевой загрузки "
                 f"помечены сканером инъекций и ждут проверки владельцем (memobase_quarantine_list)."
             )
+        if result.get("chunks_flagged_injection"):
+            parts.append(
+                f"Внимание: в {result['chunks_flagged_injection']} фрагмент(ах) найдены признаки "
+                f"prompt-инъекции — проиндексированы, но при выдаче помечаются предупреждением."
+            )
         if not result.get("vector_index_ready", True):
             parts.append("Векторный индекс недоступен (sqlite-vec не установлен) — работает только текстовый поиск.")
         # Which transcript source actually won (youtube/STT ingest only).

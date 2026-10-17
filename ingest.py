@@ -380,6 +380,12 @@ def ingest_source(
     # (`memobase_quarantine_list`/`memobase_quarantine_review`), and simply excluded from
     # `usable` for this run — never embedded, never indexed, until approved.
     guest_quarantined_count = 0
+    owner_flagged_injection = 0
+    if uploader_user_id is None:
+        # Owner upload: trusted enough to index, but still scanned — flagged
+        # chunks are reported (and get the warning banner at read time via
+        # security.fence_untrusted), never silently passed.
+        owner_flagged_injection = sum(1 for _, c in usable if security.scan_injections(c["text"]))
     if uploader_user_id is not None:
         # `_guest_injection_scan` returns positions in the list it is given;
         # map them back to the ORIGINAL raw_chunks indices carried in `usable`
@@ -638,6 +644,7 @@ def ingest_source(
         "chunks_tombstoned": len(tombstoned_ids),
         "chunks_quarantined": len(blocked_indices),
         "chunks_quarantined_injection": guest_quarantined_count,
+        "chunks_flagged_injection": owner_flagged_injection,
         "quarantine": quarantine_report,
         "vector_index_ready": vec_ready,
         # Observability extras (best-effort, read from data this call already

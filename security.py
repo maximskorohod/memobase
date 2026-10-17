@@ -601,13 +601,7 @@ def fence_untrusted(text: str, *, source: str = "memobase", meta: Optional[str] 
     and *source* is attribute-escaped.
     """
     body = _neutralize_fence_tags(text or "")
-    findings: List[str] = []
-    try:
-        from tools.threat_patterns import scan_for_threats
-
-        findings = scan_for_threats(body, scope="context")
-    except Exception:
-        logger.debug("threat_patterns scan unavailable; fencing without it", exc_info=True)
+    findings: List[str] = scan_injections(text or "")
 
     banner = ""
     if findings:
@@ -735,19 +729,58 @@ def check_daily_call_quota(quota: Dict[str, float], *, calls_today: int) -> Quot
     return QuotaCheckResult(True)
 
 
+# Russian-language injection phrasings — hermes' threat_patterns is
+# English-only, and the bulk of this knowledge base's content is Russian.
+# Matched on NFKC-normalized, lowercased text with ё folded to е.
+_RU_INJECTION_PATTERNS: List[tuple] = [
+    (r"(?:игнорируй|игнорируйте|игнорировать|проигнорируй|забудь|забудьте|не\s+обращай\s+внимания\s+на|"
+     r"отмени|отбрось|нарушь)\s+(?:\S+\s+){0,3}?(?:предыдущ\w*|прошл\w*|вышеуказанн\w*|выше\w*|"
+     r"прежн\w*|изначальн\w*|все\s+сво\w*|свои|все)\s+(?:\S+\s+){0,2}?"
+     r"(?:инструкц\w*|указани\w*|правил\w*|команд\w*|ограничен\w*|настройк\w*)",
+     "prompt_injection_ru"),
+    (r"(?:покажи|выведи|раскрой|напиши|перескажи|процитируй|повтори|сообщи)\s+(?:\S+\s+){0,3}?"
+     r"(?:системн\w*\s+(?:промпт\w*|промт\w*|подсказк\w*|инструкц\w*|сообщени\w*)|"
+     r"сво\w*\s+(?:промпт\w*|промт\w*|инструкц\w*))",
+     "system_prompt_exfil_ru"),
+    (r"\bсистемн\w*\s+(?:промпт\w*|промт\w*)\b", "system_prompt_mention_ru"),
+    (r"(?:\bты\s+теперь|\bтеперь\s+ты|\bотныне\s+ты)\s+(?:\S+\s+){0,2}?"
+     r"(?:ассистент\w*|бот\w*|модел\w*|ии\b|ai\b|dan\b|без\s+ограничен\w*|"
+     r"являешься|свободн\w*|подчиняешься)",
+     "role_override_ru"),
+    (r"(?:новые|обновл[её]нные|настоящие|секретные)\s+инструкции\s*:", "new_instructions_ru"),
+    (r"(?:отправь|перешли|выведи|покажи|раскрой)\s+(?:\S+\s+){0,3}?"
+     r"(?:api[\s-]?ключ\w*|апи[\s-]?ключ\w*|ключ\w*\s+api|токен\w*|парол\w*|секрет\w*)",
+     "secret_exfil_ru"),
+]
+_RU_INJECTION_COMPILED = [(re.compile(p, re.IGNORECASE | re.UNICODE), pid) for p, pid in _RU_INJECTION_PATTERNS]
+
+
+def _scan_injections_ru(text: str) -> List[str]:
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKC", text[:_MAX_SCAN_CHARS]).lower().replace("ё", "е")
+    return [pid for rx, pid in _RU_INJECTION_COMPILED if rx.search(normalized)]
+
+
 def scan_injections(text: str) -> List[str]:
-    """Thin, reusable wrapper around hermes' own
-    ``tools.threat_patterns.scan_for_threats`` — the same source
-    :func:`fence_untrusted` already uses for its warning banner. Exposed
-    standalone here so ingest.py's guest-upload STRICT gate (§1.4: "сканер
-    инъекций и секретов работает для них в строгом режиме без возможности
-    отключения") can act on the finding list directly (route the chunk to
-    the owner-review quarantine) rather than only annotating it at read
-    time. Never raises — returns ``[]`` if the scanner is unavailable."""
+    """Injection findings for *text*: hermes' own
+    ``tools.threat_patterns.scan_for_threats`` (English patterns, invisible
+    unicode) PLUS this module's Russian patterns. Used by
+    :func:`fence_untrusted` for its warning banner, by ingest.py's
+    guest-upload STRICT gate (route the chunk to the owner-review
+    quarantine) and, for owner uploads, to flag chunks in the ingest report.
+    Never raises — the hermes part degrades to ``[]`` if unavailable."""
+    findings: List[str] = []
     try:
         from tools.threat_patterns import scan_for_threats
 
-        return list(scan_for_threats(text or "", scope="context") or [])
+        findings = list(scan_for_threats(text or "", scope="context") or [])
     except Exception:
         logger.debug("scan_injections: threat_patterns unavailable", exc_info=True)
-        return []
+    try:
+        for pid in _scan_injections_ru(text or ""):
+            if pid not in findings:
+                findings.append(pid)
+    except Exception:  # noqa: BLE001 - scanner must never break ingest/query
+        logger.debug("scan_injections: RU scan failed", exc_info=True)
+    return findings
