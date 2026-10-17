@@ -212,3 +212,53 @@ class TestSecretsNotInUrls:
         )
         assert "ACCT123" not in msg and "SECRET" not in msg
         assert "api.cloudflare.com" in msg and "ValueError" in msg
+
+
+# ===========================================================================
+# 6. Atomic DDL (swap_vec_table / migrations)
+# ===========================================================================
+
+
+class TestAtomicDdl:
+    def test_failed_swap_keeps_live_vec_table(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            if not kb.db.load_sqlite_vec(conn):
+                pytest.skip("sqlite-vec unavailable")
+            cid = kb.db.create_collection(conn, "swapc", embedder_dims=3)
+            assert kb.db.ensure_vec_table(conn, cid, 3)
+            assert kb.db.ensure_vec_table(conn, cid, 3, shadow=True)
+            live = kb.db.vec_table_name(cid)
+            shadow = kb.db.vec_table_name(cid, shadow=True)
+            with conn:
+                conn.execute(f"INSERT INTO {live}(chunk_id, embedding) VALUES (1, ?)",
+                             (kb.embed.serialize_vector([0.1, 0.2, 0.3]),))
+                conn.execute(f"INSERT INTO {shadow}(chunk_id, embedding) VALUES (1, ?)",
+                             (kb.embed.serialize_vector([0.3, 0.2, 0.1]),))
+            # Wrong dims: the copy into the recreated live table fails.
+            with pytest.raises(kb.db.DbError):
+                kb.db.swap_vec_table(conn, cid, 5)
+            assert kb.db.vec_table_exists(conn, cid)
+            assert conn.execute(f"SELECT COUNT(*) AS n FROM {live}").fetchone()["n"] == 1
+            assert kb.db.vec_table_exists(conn, cid, shadow=True)
+        finally:
+            conn.close()
+
+    def test_migrate_from_v1_adds_column_once(self, kb, tmp_path):
+        import sqlite3
+        path = tmp_path / "old.db"
+        raw = sqlite3.connect(str(path))
+        raw.execute("CREATE TABLE spend (id INTEGER PRIMARY KEY, ts REAL NOT NULL, provider TEXT NOT NULL, "
+                    "op TEXT NOT NULL, units REAL, est_usd REAL, collection_id INTEGER)")
+        raw.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT)")
+        raw.execute("INSERT INTO _meta VALUES ('schema_version', '1')")
+        raw.commit()
+        raw.close()
+        conn = kb.db.get_connection(db_path=path)
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(spend)")}
+            assert "user_id" in cols
+            assert kb.db.get_schema_version(conn) == kb.db.SCHEMA_VERSION
+            kb.db.migrate(conn)  # idempotent
+        finally:
+            conn.close()

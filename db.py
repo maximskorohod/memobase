@@ -26,6 +26,7 @@ defensively"):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sqlite3
@@ -377,6 +378,37 @@ def get_connection(*, read_only: bool = False, ensure_schema: bool = True, db_pa
 
 
 # ---------------------------------------------------------------------------
+# Explicit transactions
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def immediate_transaction(conn: sqlite3.Connection):
+    """``BEGIN IMMEDIATE`` ... ``COMMIT`` (``ROLLBACK`` on any exception).
+
+    Python's sqlite3 in its default (legacy) transaction mode only opens an
+    implicit transaction before INSERT/UPDATE/DELETE — DDL (CREATE/DROP)
+    runs in autocommit, so a ``with conn:`` block mixing DDL and DML is NOT
+    atomic. Everything inside this block is. Takes the write lock up front
+    (IMMEDIATE), so a concurrent writer waits on busy_timeout instead of
+    failing mid-way. Do not call ``with conn:``-style helpers inside: their
+    commit() would end this transaction early.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            logger.error("rollback failed", exc_info=True)
+        raise
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Schema init / migrations
 # ---------------------------------------------------------------------------
 
@@ -390,22 +422,32 @@ def init_schema(conn: sqlite3.Connection) -> None:
         with conn:
             for stmt in DDL_STATEMENTS:
                 conn.execute(stmt)
+        _ensure_meta_defaults(conn)
+        # Migrations BEFORE indexes: an index may reference a column a
+        # migration adds (idx_spend_user -> spend.user_id), so on an
+        # upgraded v1 DB creating it first failed with "no such column".
+        migrate(conn)
+        with conn:
             for stmt in INDEX_STATEMENTS:
                 conn.execute(stmt)
-        _ensure_meta_defaults(conn)
-        migrate(conn)
     except sqlite3.Error as exc:
         raise DbError(f"failed to initialize kb schema: {exc}") from exc
 
 
 def _ensure_meta_defaults(conn: sqlite3.Connection) -> None:
-    row = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'").fetchone()
-    if row is None:
-        with conn:
-            conn.execute(
-                "INSERT INTO _meta(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+    # INSERT OR IGNORE: two processes opening a fresh DB at once must not
+    # race into a UNIQUE violation on the check-then-insert.
+    if conn.execute("SELECT 1 FROM _meta WHERE key = 'schema_version'").fetchone() is not None:
+        return
+    # A pre-versioning DB (spend table without user_id) starts at v1 so the
+    # migrations still run; a fresh DB is created at the current version.
+    spend_cols = {row["name"] for row in conn.execute("PRAGMA table_info(spend)").fetchall()}
+    version = SCHEMA_VERSION if "user_id" in spend_cols else 1
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO _meta(key, value) VALUES ('schema_version', ?)",
+            (str(version),),
+        )
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -442,12 +484,17 @@ def migrate(conn: sqlite3.Connection) -> None:
     """Apply any pending migrations in ``_MIGRATIONS``, in order, updating
     ``_meta.schema_version`` after each. Never raises for "nothing to do".
     """
-    current = get_schema_version(conn)
+    if not _MIGRATIONS or get_schema_version(conn) >= max(v for v, _ in _MIGRATIONS):
+        return  # fast path: no write lock taken on every connection
     for target_version, steps in _MIGRATIONS:
-        if target_version <= current:
-            continue
         try:
-            with conn:
+            # One explicit transaction per step, with the version re-read
+            # INSIDE it: ALTER TABLE is DDL (autocommit under legacy
+            # sqlite3), so `with conn:` would not make it atomic, and a
+            # concurrent process may have migrated in the meantime.
+            with immediate_transaction(conn):
+                if get_schema_version(conn) >= target_version:
+                    continue
                 for step in steps:
                     if callable(step):
                         step(conn)
@@ -458,7 +505,6 @@ def migrate(conn: sqlite3.Connection) -> None:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (str(target_version),),
                 )
-            current = target_version
         except sqlite3.Error as exc:
             raise DbError(f"migration to schema version {target_version} failed: {exc}") from exc
 
@@ -697,7 +743,10 @@ def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int) -> N
     if not vec_table_exists(conn, collection_id, shadow=True):
         raise DbError(f"cannot swap: shadow table {shadow} does not exist")
     try:
-        with conn:
+        # Explicit BEGIN IMMEDIATE: DROP/CREATE are DDL and would otherwise
+        # run in autocommit, leaving a dropped live table behind if the copy
+        # fails (see immediate_transaction).
+        with immediate_transaction(conn):
             # Tolerant drop: the live table may be CORRUPT here -- if this DB
             # ever ran the old rename-based swap, ``live`` points at companion
             # tables that no longer exist and a plain DROP would fail (B11).
