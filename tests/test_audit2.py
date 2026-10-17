@@ -347,3 +347,96 @@ class TestSufficiencyGate:
         fake_llm.next_text = '{"answer": "24 [chunk:1]", "citations": [{"chunk_id": 1, "quote": "Гарантийный срок 24 месяца"}]}'
         res = kb.answer.answer(None, 1, "гарантийный срок", self.CFG, llm=fake_llm)
         assert res["near_miss"] is True and fake_llm.calls
+
+
+# ===========================================================================
+# 7. SSRF: connect-time IP validation, overall deadline
+# ===========================================================================
+
+
+class _Server:
+    """Tiny local HTTP server (127.0.0.1) for safe_get tests; the SSRF
+    private-address rejection is monkeypatched off for these."""
+
+    def __init__(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.t.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class TestSafeGet:
+    def test_dns_rebinding_blocked_at_connect(self, kb, monkeypatch):
+        import socket
+        calls = {"n": 0}
+
+        def fake_getaddrinfo(host, port, *a, **k):
+            calls["n"] += 1
+            ip = "93.184.216.34" if calls["n"] == 1 else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+        monkeypatch.setattr(kb.security.socket, "getaddrinfo", fake_getaddrinfo)
+        with pytest.raises(kb.security.SsrfError):
+            kb.security.safe_get("http://rebind.example/x")
+        assert calls["n"] >= 2  # validated again at connect time
+
+    def test_fetch_and_download_via_local_server(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.security, "_reject_if_private", lambda ip, host: None)
+
+        def body(h):
+            data = b"hello world"
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+
+        srv = _Server(body)
+        try:
+            url = f"http://127.0.0.1:{srv.port}/f"
+            assert kb.security.safe_get(url) == b"hello world"
+            dest = tmp_path / "out.bin"
+            assert kb.security.safe_download(url, str(dest)) == 11
+            assert dest.read_bytes() == b"hello world"
+            with pytest.raises(kb.security.SecurityError):
+                kb.security.safe_get(url, max_bytes=5)
+        finally:
+            srv.close()
+
+    def test_total_deadline_stops_slow_drip(self, kb, monkeypatch):
+        import time as _t
+        monkeypatch.setattr(kb.security, "_reject_if_private", lambda ip, host: None)
+
+        def body(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            try:
+                for _ in range(100):
+                    h.wfile.write(b"x" * 10)
+                    h.wfile.flush()
+                    _t.sleep(0.2)
+            except Exception:
+                pass
+
+        srv = _Server(body)
+        try:
+            start = _t.monotonic()
+            with pytest.raises(kb.security.FetchError):
+                kb.security.safe_get(f"http://127.0.0.1:{srv.port}/slow", total_timeout=1.0)
+            assert _t.monotonic() - start < 5
+        finally:
+            srv.close()

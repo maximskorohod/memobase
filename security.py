@@ -164,79 +164,220 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_MAX_BYTES = 25 * 1024 * 1024  # 25 MB pre-fetch/download cap
 DEFAULT_TIMEOUT_S = 15.0
+DEFAULT_TOTAL_TIMEOUT_S = 120.0  # wall-clock budget for the WHOLE download (all hops/retries)
 MAX_REDIRECTS = 5
 _RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+_REDIRECT_STATUS = (301, 302, 303, 307, 308)
+_MAX_CONNECT_IPS = 4
+
+
+class FetchError(RuntimeError):
+    """Non-guard failure of :func:`safe_get` (HTTP error status, network
+    error, deadline). Message carries only the host, never the full URL."""
+
+
+def _resolve_validated_ips(host: str) -> List[str]:
+    """Resolve *host* and validate EVERY answer; return the IPs to dial.
+
+    This runs at connect time and the returned IP is what actually gets
+    dialed (see :func:`_open_pinned`) — so a DNS answer that changes between
+    a pre-flight check and the TCP connect (DNS rebinding) cannot redirect
+    the request to an internal address.
+    """
+    stripped = host.strip("[]")
+    try:
+        literal = ipaddress.ip_address(stripped)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        _reject_if_private(literal, host)
+        return [stripped]
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SsrfError(f"could not resolve host {host!r}: {exc}") from exc
+    ips: List[str] = []
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        addr = str(sockaddr[0]).split("%", 1)[0]
+        _reject_if_private(ipaddress.ip_address(addr), host)
+        if addr not in ips:
+            ips.append(addr)
+    if not ips:
+        raise SsrfError(f"no addresses resolved for host {host!r}")
+    return ips[:_MAX_CONNECT_IPS]
+
+
+def _ca_bundle() -> Optional[str]:
+    try:
+        import certifi
+
+        return certifi.where()
+    except ImportError:
+        return None  # urllib3 falls back to the system trust store
+
+
+def _open_pinned(url: str, *, headers: Dict[str, str], timeout: float):
+    """GET *url* (no redirect following) over a connection dialed to a
+    validated IP, while Host header / TLS SNI / certificate verification use
+    the original hostname. Returns ``(response, pool)``; caller closes both."""
+    import urllib3
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    https = parsed.scheme.lower() == "https"
+    port = parsed.port or (443 if https else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    default_port = (https and port == 443) or (not https and port == 80)
+    host_header = host if ":" not in host else f"[{host}]"
+    if not default_port:
+        host_header += f":{port}"
+    req_headers = {**headers, "Host": host_header}
+    t = urllib3.Timeout(connect=timeout, read=timeout)
+
+    last_exc: Optional[BaseException] = None
+    for ip in _resolve_validated_ips(host):
+        if https:
+            pool = urllib3.HTTPSConnectionPool(
+                ip, port, timeout=t, retries=False, maxsize=1, cert_reqs="CERT_REQUIRED",
+                ca_certs=_ca_bundle(), server_hostname=host, assert_hostname=host,
+            )
+        else:
+            pool = urllib3.HTTPConnectionPool(ip, port, timeout=t, retries=False, maxsize=1)
+        try:
+            resp = pool.urlopen(
+                "GET", path, headers=req_headers, redirect=False, retries=False,
+                preload_content=False, assert_same_host=False,
+            )
+            return resp, pool
+        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.ConnectTimeoutError) as exc:
+            last_exc = exc
+            pool.close()
+            continue
+        except urllib3.exceptions.HTTPError as exc:
+            pool.close()
+            raise FetchError(describe_request_error(url, exc)) from exc
+    raise FetchError(describe_request_error(url, last_exc or OSError("no usable address")))
+
+
+def _safe_stream(url: str, sink, *, timeout: float, max_bytes: int, max_redirects: int,
+                 max_retries: int, headers: Optional[Dict[str, str]], total_timeout: float) -> int:
+    """Shared engine of :func:`safe_get` / :func:`safe_download`: feeds the
+    body to *sink* piece by piece, returns the byte count."""
+    import urllib3
+
+    req_headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept-Encoding": "gzip, deflate", **(headers or {})}
+    deadline = time.monotonic() + total_timeout
+    attempt = 0
+
+    def _remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise FetchError(f"download from {url_host(url)} exceeded the {total_timeout:.0f}s deadline")
+        return left
+
+    while True:
+        current_url = url
+        for _hop in range(max_redirects + 1):
+            check_url(current_url)  # scheme/credentials/host policy for THIS hop
+            resp, pool = _open_pinned(current_url, headers=req_headers, timeout=min(timeout, _remaining()))
+            try:
+                status = resp.status
+                if status in _REDIRECT_STATUS:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        raise SecurityError(f"redirect from {url_host(current_url)} had no Location header")
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
+                if status in _RETRYABLE_STATUS and attempt < max_retries:
+                    backoff = min(2 ** attempt, 30)
+                    attempt += 1
+                    if backoff >= _remaining():
+                        raise FetchError(f"HTTP {status} from {url_host(current_url)} (no time left to retry)")
+                    time.sleep(backoff)
+                    break  # restart the whole redirect chain on retry
+                if status >= 400:
+                    raise FetchError(f"HTTP {status} from {url_host(current_url)}")
+
+                total = 0
+                try:
+                    # read1 returns as soon as ANY data is available (stream()
+                    # would block until a full 64 KiB arrived, letting a
+                    # slow-drip server overrun the deadline between checks).
+                    reader = getattr(resp, "read1", None) or resp.read
+                    while True:
+                        piece = reader(65536, decode_content=True)
+                        if not piece:
+                            break
+                        total += len(piece)
+                        if total > max_bytes:
+                            raise SecurityError(
+                                f"response from {url_host(current_url)} exceeded max_bytes={max_bytes}"
+                            )
+                        sink(piece)
+                        _remaining()
+                except urllib3.exceptions.HTTPError as exc:
+                    raise FetchError(describe_request_error(current_url, exc)) from exc
+                return total
+            finally:
+                resp.release_conn()
+                resp.close()
+                pool.close()
+        else:
+            raise SecurityError(f"too many redirects (>{max_redirects}) fetching {url_host(url)}")
+        continue  # reached only via the retry `break` above
 
 
 def safe_get(url: str, *, timeout: float = DEFAULT_TIMEOUT_S, max_bytes: int = DEFAULT_MAX_BYTES,
              max_redirects: int = MAX_REDIRECTS, max_retries: int = 3,
-             headers: Optional[Dict[str, str]] = None) -> bytes:
-    """SSRF-guarded, size/time-capped, retrying GET.
+             headers: Optional[Dict[str, str]] = None,
+             total_timeout: float = DEFAULT_TOTAL_TIMEOUT_S) -> bytes:
+    """SSRF-guarded, size/time-capped, retrying GET returning the body.
 
     Centralizes the "every external HTTP call: browser UA, timeout, backoff,
     SSRF-safe" contract so extract.py's URL ingest path (and its pre-fetch
     size estimate, which reads the source too and so needs the same guard)
     don't have to reimplement it.
 
-    Re-validates :func:`check_url` on the ORIGINAL url and on every redirect
-    hop's resolved target before following it — an initially safe host
-    redirecting to an internal address is the classic SSRF bypass.
-    Streams the response and aborts once ``max_bytes`` is exceeded, so a
-    large/slow response cannot exhaust memory before the cap is noticed.
-    Retries on 429/5xx with exponential backoff (capped at 30s) up to
-    ``max_retries`` times.
+    SSRF: :func:`check_url` runs on the original URL and on EVERY redirect
+    hop, and the connection itself is dialed to an IP validated at connect
+    time (:func:`_open_pinned`) with Host/SNI/cert checks on the original
+    hostname — closing the DNS-rebinding gap between "check" and "connect".
+    Streams the response and aborts once ``max_bytes`` is exceeded; the
+    whole download (all hops, retries, the body) shares one
+    ``total_timeout`` wall-clock deadline, so a slow-drip server cannot hold
+    the call open indefinitely. Retries on 429/5xx with exponential backoff.
 
-    Raises :class:`SecurityError`/:class:`SsrfError` on guard failures.
-    Raises ``requests.RequestException`` on network failures after retries
-    are exhausted — callers should catch broadly and degrade (log + skip
-    the source), never let it crash an ingest job.
+    Raises :class:`SecurityError`/:class:`SsrfError` on guard failures and
+    :class:`FetchError` on HTTP/network failures or the deadline — callers
+    catch broadly and degrade (log + skip the source).
     """
-    import requests  # heavy/optional import kept local; see install.ps1
+    content = bytearray()
+    _safe_stream(url, content.extend, timeout=timeout, max_bytes=max_bytes, max_redirects=max_redirects,
+                 max_retries=max_retries, headers=headers, total_timeout=total_timeout)
+    return bytes(content)
 
-    req_headers = {"User-Agent": DEFAULT_USER_AGENT, **(headers or {})}
-    attempt = 0
 
-    while True:
-        current_url = url
-        for _hop in range(max_redirects + 1):
-            check_url(current_url)
-            resp = requests.get(
-                current_url, timeout=timeout, headers=req_headers, stream=True, allow_redirects=False,
-            )
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location")
-                resp.close()
-                if not location:
-                    raise SecurityError(f"redirect from {current_url} had no Location header")
-                current_url = urllib.parse.urljoin(current_url, location)
-                continue
+def safe_download(url: str, dest_path: str, *, timeout: float = DEFAULT_TIMEOUT_S,
+                  max_bytes: int = DEFAULT_MAX_BYTES, max_redirects: int = MAX_REDIRECTS,
+                  max_retries: int = 3, headers: Optional[Dict[str, str]] = None,
+                  total_timeout: float = DEFAULT_TOTAL_TIMEOUT_S) -> int:
+    """Same guards as :func:`safe_get`, but streams the body straight to
+    *dest_path* (never holding it in RAM). Returns the byte count; removes a
+    partial file on failure."""
+    import os as _os
 
-            if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
-                resp.close()
-                backoff = min(2 ** attempt, 30)
-                attempt += 1
-                time.sleep(backoff)
-                break  # restart the whole redirect chain on retry
-
-            content = bytearray()
-            try:
-                for piece in resp.iter_content(chunk_size=65536):
-                    if not piece:
-                        continue
-                    content.extend(piece)
-                    if len(content) > max_bytes:
-                        raise SecurityError(
-                            f"response from {current_url} exceeded max_bytes={max_bytes}"
-                        )
-                resp.raise_for_status()
-            finally:
-                resp.close()
-            return bytes(content)
-        else:
-            raise SecurityError(f"too many redirects (>{max_redirects}) fetching {url}")
-        # We only reach here via the `break` on a retryable status; loop
-        # around the outer `while True` to restart the redirect chain.
-        continue
+    try:
+        with open(dest_path, "wb") as f:
+            return _safe_stream(url, f.write, timeout=timeout, max_bytes=max_bytes, max_redirects=max_redirects,
+                                max_retries=max_retries, headers=headers, total_timeout=total_timeout)
+    except BaseException:
+        try:
+            _os.remove(dest_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
