@@ -143,14 +143,17 @@ def clear_wizard(chat_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def is_owner_allowed(user_id: Optional[str], memobase_cfg: Dict[str, Any]) -> bool:
+def is_owner_allowed(user_id: Optional[str], memobase_cfg: Dict[str, Any], *, may_claim: bool = True) -> bool:
     """First caller ever to reach the wizard claims ``memobase.owner_user_id`` if
-    unset; everyone else must already match it. Mirrors
-    ``security.is_privileged``'s "unset owner = not yet claimed" posture."""
+    unset (only when *may_claim* — see :func:`_may_claim_owner`); everyone
+    else must already match it. Mirrors ``security.is_privileged``'s "unset
+    owner = not yet claimed" posture."""
     if not user_id:
         return False
     owner = (memobase_cfg or {}).get("owner_user_id") or ""
     if not owner:
+        if not may_claim:
+            return False
         try:
             from . import config as kb_config
 
@@ -311,6 +314,41 @@ def _send_async(gateway: Any, platform: Any, chat_id: str, text: str) -> None:
         logger.warning("wizard: failed to send reply via gateway adapter", exc_info=True)
 
 
+_DM_CHAT_TYPES = frozenset({"dm", "direct", "private"})
+
+
+def _sender_authorized(gateway: Any, source: Any) -> bool:
+    """``pre_gateway_dispatch`` runs BEFORE the gateway's own allowlist
+    check (gateway/run_inbound.py), so this hook must not act for a sender
+    the gateway is about to reject. Fails closed when the check is missing."""
+    check = getattr(gateway, "_is_user_authorized_for_source", None) or getattr(gateway, "_is_user_authorized", None)
+    if check is None:
+        return False
+    try:
+        return bool(check(source))
+    except Exception:  # noqa: BLE001
+        logger.debug("wizard: gateway authorization check failed", exc_info=True)
+        return False
+
+
+def _may_claim_owner(gateway: Any, source: Any, user_id: Optional[str]) -> bool:
+    """Claiming the (unset) owner seat is the most privileged act in this
+    plugin: allow it only from a private chat, and only for a gateway slash
+    admin when the operator configured admin gating (allow_admin_from)."""
+    chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+    if chat_type not in _DM_CHAT_TYPES:
+        return False
+    try:
+        from gateway.slash_access import policy_for_runner_source
+    except ImportError:
+        return True  # older hermes: no admin concept — DM + allowlisted is the best available
+    try:
+        return bool(policy_for_runner_source(gateway, source).is_admin(user_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("wizard: slash access policy check failed", exc_info=True)
+        return False
+
+
 def on_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: Any = None, **_kw: Any) -> Optional[Dict[str, Any]]:
     """``pre_gateway_dispatch`` hook: intercepts ``/memobase setup`` and any
     follow-up message while a wizard is active for this chat, BEFORE the
@@ -327,13 +365,18 @@ def on_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: A
         text = getattr(event, "text", "") or ""
         if not chat_id:
             return None
+        if not (_SETUP_TRIGGER_RE.match(text) or is_active(chat_id)):
+            return None
+        if not _sender_authorized(gateway, source):
+            return None  # let the gateway's own auth reject it; never claim/answer for a stranger
 
         from . import config as kb_config
 
         memobase_cfg = kb_config.get_memobase_config_readonly()
 
         if _SETUP_TRIGGER_RE.match(text):
-            if not is_owner_allowed(user_id, memobase_cfg):
+            may_claim = _may_claim_owner(gateway, source, user_id)
+            if not is_owner_allowed(user_id, memobase_cfg, may_claim=may_claim):
                 _send_async(gateway, platform, chat_id, "Мастер настройки доступен только владельцу базы знаний.")
                 return {"action": "skip", "reason": "kb_setup_not_owner"}
             reply = start_wizard(chat_id, user_id)

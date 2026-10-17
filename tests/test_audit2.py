@@ -836,3 +836,65 @@ class TestSmallHardening:
         sqlite3.connect(str(db_path)).close()
         res = kb.backup.run_doctor({"backup": {}}, db_path=db_path, backup_dir=tmp_path)
         assert res["ok"] is False and "совпадает" in res["steps"]["snapshot"]["error"]
+
+
+# ===========================================================================
+# 15. ACL review: wizard owner claim, bound sessions, sentinel id
+# ===========================================================================
+
+
+class _Src:
+    def __init__(self, user_id="u1", chat_id="c1", chat_type="dm"):
+        self.user_id, self.chat_id, self.chat_type, self.platform = user_id, chat_id, chat_type, "telegram"
+
+
+class _Ev:
+    def __init__(self, text, source):
+        self.text, self.source = text, source
+
+
+class _Gw:
+    def __init__(self, authorized):
+        self._authorized = authorized
+        self.adapters = {}
+        self.config = None
+
+    def _is_user_authorized_for_source(self, source):
+        return self._authorized
+
+
+class TestWizardAndAcl:
+    def test_unauthorized_stranger_cannot_claim_owner(self, kb):
+        res = kb.wizard.on_gateway_dispatch(_Ev("/memobase setup", _Src("stranger")), gateway=_Gw(False))
+        assert res is None
+        assert not kb.config.get_memobase_config_readonly().get("owner_user_id")
+
+    def test_owner_claim_only_from_dm(self, kb):
+        res = kb.wizard.on_gateway_dispatch(_Ev("/memobase setup", _Src("g1", chat_type="group")), gateway=_Gw(True))
+        assert res is not None and res["reason"] == "kb_setup_not_owner"
+        assert not kb.config.get_memobase_config_readonly().get("owner_user_id")
+
+    def test_owner_claim_from_authorized_dm(self, kb):
+        res = kb.wizard.on_gateway_dispatch(_Ev("/memobase setup", _Src("me")), gateway=_Gw(True))
+        assert res is not None and res["reason"] == "kb_setup_wizard"
+        assert kb.config.get_memobase_config_readonly().get("owner_user_id") == "me"
+
+    def test_bound_session_status_other_collection_refused(self, kb):
+        kb.tools.bind_session_collection("child-1", "alpha")
+        out = kb.tools.memobase_status({"collection": "beta"}, session_id="child-1")
+        assert "привязана" in out
+        out = kb.tools.memobase_list_documents({"collection": "beta"}, session_id="child-1")
+        assert "привязана" in out
+
+    def test_cannot_share_to_unresolved_sentinel(self, kb):
+        conn = kb.db.get_connection()
+        try:
+            kb.db.create_collection(conn, "shr")
+        finally:
+            conn.close()
+        out = kb.tools.memobase_share({"collection": "shr", "user_id": kb.tools.UNRESOLVED_MESSAGING_USER}, session_id=None)
+        assert "служебному" in out
+
+    def test_quarantine_review_bad_id(self, kb):
+        out = kb.tools.memobase_quarantine_review({"quarantine_id": "abc", "action": "approve"}, session_id=None)
+        assert "число" in out

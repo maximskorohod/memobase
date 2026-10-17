@@ -1054,8 +1054,25 @@ def _keys_status_block(memobase_cfg: Dict[str, Any], privileged: bool) -> str:
         return ""
 
 
+def _bound_mismatch(args: Dict[str, Any], session_id: Optional[str]) -> Optional[str]:
+    """Refusal when a collection-bound (delegated) session names another
+    collection — the same rule `_resolve_collection_name` enforces, for the
+    enumerate-style handlers that do not go through it."""
+    bound = get_session_binding(session_id)
+    requested = args.get("collection")
+    if bound and requested and requested != bound:
+        return (
+            f"Эта сессия привязана к коллекции «{bound}» и не может обращаться к «{requested}». "
+            f"Отказ выполнен в коде, а не по решению модели."
+        )
+    return None
+
+
 def memobase_status(args: Dict[str, Any], **kwargs: Any) -> str:
     session_id = kwargs.get("session_id")
+    mismatch = _bound_mismatch(args, session_id)
+    if mismatch:
+        return mismatch
     bound = get_session_binding(session_id)
     requested = args.get("collection") or bound
 
@@ -1151,13 +1168,19 @@ MEMOBASE_LIST_DOCUMENTS_SCHEMA: Dict[str, Any] = {
 
 def memobase_list_documents(args: Dict[str, Any], **kwargs: Any) -> str:
     session_id = kwargs.get("session_id")
+    mismatch = _bound_mismatch(args, session_id)
+    if mismatch:
+        return mismatch
     bound = get_session_binding(session_id)
     requested = args.get("collection") or bound
 
     memobase_cfg = kb_config.get_memobase_config_readonly()
     user_id = get_session_user(session_id)
     privileged = security.is_privileged(user_id, memobase_cfg)
-    limit = int(args.get("limit") or 50)
+    try:
+        limit = max(1, min(int(args.get("limit") or 50), 500))
+    except (TypeError, ValueError):
+        limit = 50
 
     conn = db.get_connection()
     try:
@@ -1240,12 +1263,27 @@ def memobase_selfcheck(args: Dict[str, Any], **kwargs: Any) -> str:
 
     conn = db.get_connection()
     try:
-        row, _user_id, name, refusal = _authorize_collection(conn, args, session_id, memobase_cfg, need="write")
+        row, user_id, name, refusal = _authorize_collection(conn, args, session_id, memobase_cfg, need="write")
         if refusal:
             return refusal
         if row is None:
             return f"Коллекция «{name}» не найдена."
         collection_cfg = kb_config.get_collection_cfg(row, memobase_cfg=memobase_cfg)
+        if not security.is_privileged(user_id, memobase_cfg):
+            # A guest's selfcheck burns an LLM call plus up to sample_size
+            # searches: rate-limit + daily call quota, small sample, and no
+            # paid rerank on the owner's Cohere budget.
+            rate_refusal = _check_guest_rate_limit(user_id, memobase_cfg)
+            if rate_refusal:
+                return rate_refusal
+            quota = security.effective_guest_quota(memobase_cfg, db.get_guest_quota(conn, user_id))
+            calls_check = security.check_daily_call_quota(quota, calls_today=db.get_guest_usage_today(conn, user_id)["calls"])
+            if not calls_check.ok:
+                return f"Гостевая квота исчерпана: {calls_check.reason}."
+            db.record_guest_usage(conn, user_id, calls=1)
+            sample_size = min(sample_size, selfcheck_mod.DEFAULT_SAMPLE_SIZE)
+            collection_cfg["rerank"] = {**(collection_cfg.get("rerank") or {}), "enabled": False}
+        sample_size = max(1, min(sample_size, 50))
         report = selfcheck_mod.run_selfcheck(conn, row, collection_cfg, llm=_get_llm(), sample_size=sample_size)
     finally:
         conn.close()
@@ -1298,6 +1336,14 @@ def memobase_map(args: Dict[str, Any], **kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _invalid_target_user(user_id: Any) -> Optional[str]:
+    """The deny-by-default sentinel for unresolved messaging senders is not a
+    person: granting it anything would grant EVERY unresolved sender."""
+    if str(user_id).strip().startswith("unresolved:"):
+        return f"Нельзя выдавать доступ служебному идентификатору «{user_id}» (неопознанные отправители)."
+    return None
+
+
 def _require_privileged(session_id: Optional[str], memobase_cfg: Dict[str, Any]) -> Optional[str]:
     user_id = get_session_user(session_id)
     if security.is_privileged(user_id, memobase_cfg):
@@ -1333,6 +1379,9 @@ def memobase_create_for(args: Dict[str, Any], **kwargs: Any) -> str:
     guest_user_id = args.get("user_id")
     if not name or not guest_user_id:
         return "Нужны оба параметра: collection и user_id."
+    bad_target = _invalid_target_user(guest_user_id)
+    if bad_target:
+        return bad_target
     if not security.valid_collection_name(name):
         return f"Недопустимое имя коллекции: «{name}»."
 
@@ -1385,6 +1434,9 @@ def memobase_share(args: Dict[str, Any], **kwargs: Any) -> str:
         return "Нужны оба параметра: collection и user_id."
     if permission not in ("read", "write"):
         return "Параметр permission должен быть 'read' или 'write'."
+    bad_target = _invalid_target_user(target_user_id)
+    if bad_target:
+        return bad_target
 
     conn = db.get_connection()
     try:
@@ -1549,10 +1601,13 @@ def memobase_quarantine_review(args: Dict[str, Any], **kwargs: Any) -> str:
     if refusal:
         return refusal
 
-    quarantine_id = args.get("quarantine_id")
+    try:
+        quarantine_id = int(args.get("quarantine_id"))
+    except (TypeError, ValueError):
+        quarantine_id = None
     action = (args.get("action") or "").strip().lower()
     if not quarantine_id or action not in ("approve", "reject"):
-        return "Нужны quarantine_id и action ('approve' или 'reject')."
+        return "Нужны quarantine_id (число) и action ('approve' или 'reject')."
     reviewer = get_session_user(session_id) or "owner"
 
     conn = db.get_connection()
