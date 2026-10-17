@@ -693,3 +693,106 @@ class TestMemoryCaps:
         monkeypatch.setattr(kb.youtube, "safe_download", fake_download)
         path, name = kb.youtube.download_audio_apify("abcdefghijk", dest_dir=str(tmp_path))
         assert open(path, "rb").read() == b"mp3" and name == "abcdefghijk.mp3"
+
+
+# ===========================================================================
+# 13. Embedding migration robustness
+# ===========================================================================
+
+
+def _embed_dims(texts, cfg, is_query=False):
+    dims = (cfg.get("embedder") or {}).get("dims") or 2
+    return [[0.3] * dims for _ in texts]
+
+
+class TestEmbedMigration:
+    def test_reindex_target_uses_global_embedder(self, kb):
+        row = {"id": 1, "name": "c", "embedder_provider": "cloudflare", "embedder_model": "old-model",
+               "embedder_dims": 1024, "migration_state": "idle"}
+        cfg = kb.embed.reindex_target_cfg(row, {"embedder": {"provider": "local", "model": "new-model", "dims": 768}})
+        assert cfg["embedder"] == {"provider": "local", "model": "new-model", "dims": 768}
+        # sanity: the plain collection cfg is the OLD one (what reindex used to use)
+        old = kb.config.get_collection_cfg(row, memobase_cfg={"embedder": {"provider": "local", "model": "new-model", "dims": 768}})
+        assert old["embedder"]["model"] == "old-model"
+
+    def test_reindex_catches_up_chunk_added_before_swap(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setattr(kb.embed, "embed_texts", _embed_dims)
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "catchup", embedder_dims=2)
+            if not kb.db.ensure_vec_table(conn, cid, 2):
+                pytest.skip("sqlite-vec unavailable")
+            row = kb.db.get_collection_by_id(conn, cid)
+            p = tmp_path / "a.txt"
+            p.write_text("первый документ", encoding="utf-8")
+            kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly())
+
+            real_swap = kb.db.swap_vec_table
+
+            def swap_with_late_chunk(c, collection_id, dims, **kw):
+                # a chunk that reached the DB after the shadow fill
+                doc_id = c.execute("SELECT id FROM documents LIMIT 1").fetchone()["id"]
+                with c:
+                    c.execute("INSERT INTO chunks(collection_id, document_id, seq, text, created_at) "
+                              "VALUES (?, ?, 99, 'поздний фрагмент', 0)", (collection_id, doc_id))
+                return real_swap(c, collection_id, dims, **kw)
+
+            monkeypatch.setattr(kb.db, "swap_vec_table", swap_with_late_chunk)
+            new_cfg = {"embedder": {"provider": "cloudflare", "model": "m2", "dims": 2},
+                       "chunk": {"target_tokens": 900, "overlap_pct": 0.15}}
+            res = kb.embed.reembed_collection_shadow(conn, row, new_cfg)
+            assert res["chunks_caught_up"] == 1
+            live = kb.db.vec_table_name(cid)
+            n_chunks = conn.execute("SELECT COUNT(*) AS n FROM chunks WHERE collection_id = ?", (cid,)).fetchone()["n"]
+            n_vec = conn.execute(f"SELECT COUNT(*) AS n FROM {live}").fetchone()["n"]
+            assert n_vec == n_chunks
+            r = kb.db.get_collection_by_id(conn, cid)
+            assert r["embedder_model"] == "m2" and r["migration_state"] == "idle"
+        finally:
+            conn.close()
+
+    def test_failed_migration_does_not_lock_ask(self, kb, fake_llm, monkeypatch):
+        monkeypatch.setattr(kb.retrieve, "hybrid_search", lambda *a, **k: [{
+            "chunk_id": 1, "text": "Гарантийный срок 24 месяца.", "score": 0.07, "rerank_score": None,
+            "mode": "rrf-only", "source": "fts", "source_uri": "d", "title": None,
+            "page_or_timecode": None, "section": None, "degraded": False,
+        }])
+        fake_llm.next_text = '{"answer": "24 [chunk:1]", "citations": [{"chunk_id": 1, "quote": "Гарантийный срок 24 месяца"}]}'
+        res = kb.answer.answer(None, 1, "гарантийный срок", {"migration_state": "failed", "collection_name": "c"}, llm=fake_llm)
+        assert res["refused"] is False
+        assert any("переиндексация" in g for g in res["gaps"])
+
+    def test_failed_migration_allows_ingest(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setattr(kb.embed, "embed_texts", _embed_dims)
+        p = tmp_path / "a.txt"
+        p.write_text("текст", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "failedmig", embedder_dims=2)
+            with conn:
+                conn.execute("UPDATE collections SET migration_state = 'failed' WHERE id = ?", (cid,))
+            row = kb.db.get_collection_by_id(conn, cid)
+            res = kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly())
+            assert res["status"] == "done"
+        finally:
+            conn.close()
+
+    def test_ingest_aborts_if_embedder_changed_meanwhile(self, kb, tmp_path, monkeypatch):
+        p = tmp_path / "a.txt"
+        p.write_text("текст", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "racemig", embedder_dims=2, embedder_model="m1")
+            row = kb.db.get_collection_by_id(conn, cid)
+
+            def embed_and_reindex(texts, cfg, is_query=False):
+                with conn:  # a reindex finishing while we embed
+                    conn.execute("UPDATE collections SET embedder_model = 'm2' WHERE id = ?", (cid,))
+                return _embed_dims(texts, cfg)
+
+            monkeypatch.setattr(kb.embed, "embed_texts", embed_and_reindex)
+            res = kb.ingest.ingest_source(conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly())
+            assert res["status"] == "failed"
+            assert conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"] == 0
+        finally:
+            conn.close()

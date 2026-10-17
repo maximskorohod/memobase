@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -228,9 +229,19 @@ DEFAULT_LOCAL_MODEL = "intfloat/multilingual-e5-large"
 # the first call loads (and, on first run ever, downloads) the ONNX weights;
 # every call after that is in-memory.
 _LOCAL_MODELS: Dict[str, Any] = {}
+# Two concurrent first calls must not both load (and download) a ~2 GB model.
+_LOCAL_MODELS_LOCK = threading.Lock()
 
 
 def _get_local_model(model: str):
+    inst = _LOCAL_MODELS.get(model)
+    if inst is not None:
+        return inst
+    with _LOCAL_MODELS_LOCK:
+        return _load_local_model_locked(model)
+
+
+def _load_local_model_locked(model: str):
     inst = _LOCAL_MODELS.get(model)
     if inst is None:
         try:
@@ -346,6 +357,43 @@ def _set_migration_state(conn, collection_id: int, state: str) -> None:
         )
 
 
+def reindex_target_cfg(collection_row: Dict[str, Any], memobase_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Effective config to RE-EMBED *collection_row* into: the collection's
+    own chunk/rerank settings, but the embedder from the GLOBAL
+    ``memobase.embedder`` config. (``config.get_collection_cfg`` lets the
+    row's stored embedder columns win — exactly the OLD embedder — so a
+    reindex built from it silently re-embedded with the model it was
+    supposed to replace.)"""
+    from . import config as kb_config
+
+    cfg = kb_config.get_collection_cfg(collection_row, memobase_cfg=memobase_cfg)
+    cfg["embedder"] = dict(memobase_cfg.get("embedder") or {})
+    return cfg
+
+
+def _missing_vector_chunks(conn, collection_id: int, table: str) -> List[Any]:
+    return conn.execute(
+        f"SELECT id, text FROM chunks WHERE collection_id = ? AND tombstoned_at IS NULL "
+        f"AND id NOT IN (SELECT chunk_id FROM {table}) ORDER BY id",
+        (collection_id,),
+    ).fetchall()
+
+
+def _embed_into(conn, table: str, rows: List[Any], cfg: Dict[str, Any], batch_size: int) -> int:
+    done = 0
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        vectors = embed_texts([row["text"] for row in batch], cfg)
+        with conn:
+            for row, vec in zip(batch, vectors):
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table}(chunk_id, embedding) VALUES (?, ?)",
+                    (row["id"], serialize_vector(vec)),
+                )
+        done += len(batch)
+    return done
+
+
 def reembed_collection_shadow(
     conn,
     collection_row: Dict[str, Any],
@@ -391,36 +439,13 @@ def reembed_collection_shadow(
         with conn:
             db.safe_drop_vec_table(conn, db.vec_table_name(collection_id, shadow=True))
         vec_ready = db.ensure_vec_table(conn, collection_id, dims, shadow=True)
-        chunks = conn.execute(
-            "SELECT id, text FROM chunks WHERE collection_id = ? AND tombstoned_at IS NULL ORDER BY id",
-            (collection_id,),
-        ).fetchall()
-
-        embedded_count = 0
-        if vec_ready:
-            shadow_table = db.vec_table_name(collection_id, shadow=True)
-            for start in range(0, len(chunks), batch_size):
-                batch = chunks[start : start + batch_size]
-                texts = [row["text"] for row in batch]
-                vectors = embed_texts(texts, new_cfg)
-                with conn:
-                    for row, vec in zip(batch, vectors):
-                        conn.execute(
-                            f"INSERT OR REPLACE INTO {shadow_table}(chunk_id, embedding) VALUES (?, ?)",
-                            (row["id"], serialize_vector(vec)),
-                        )
-                embedded_count += len(batch)
-            db.swap_vec_table(conn, collection_id, dims)
-        else:
-            logger.warning(
-                "sqlite-vec unavailable; migration for collection %s updates embedder config/"
-                "embed_signature only, vector index stays disabled (FTS-only)",
-                collection_id,
-            )
-
         new_signature = embedding_signature(new_cfg)
-        with conn:
-            conn.execute(
+
+        def _flip_config(c) -> None:
+            # Runs inside swap_vec_table's transaction (or on its own when
+            # there is no vector side): live vectors and the embedder
+            # columns describing them change together or not at all.
+            c.execute(
                 """
                 UPDATE collections
                    SET embedder_provider = ?, embedder_model = ?, embedder_dims = ?,
@@ -429,11 +454,47 @@ def reembed_collection_shadow(
                 """,
                 (embedder.get("provider"), embedder.get("model"), dims, collection_id),
             )
-            conn.execute(
+            c.execute(
                 "UPDATE chunks SET embed_signature = ? WHERE collection_id = ? AND tombstoned_at IS NULL",
                 (new_signature, collection_id),
             )
-        return {"status": "done", "chunks_embedded": embedded_count, "vector_index_ready": vec_ready}
+
+        embedded_count = 0
+        if vec_ready:
+            shadow_table = db.vec_table_name(collection_id, shadow=True)
+            # Fill, then top up whatever a concurrent writer added meanwhile.
+            for _round in range(3):
+                missing = _missing_vector_chunks(conn, collection_id, shadow_table)
+                if not missing:
+                    break
+                embedded_count += _embed_into(conn, shadow_table, missing, new_cfg, batch_size)
+            db.swap_vec_table(conn, collection_id, dims, in_tx=_flip_config)
+        else:
+            logger.warning(
+                "sqlite-vec unavailable; migration for collection %s updates embedder config/"
+                "embed_signature only, vector index stays disabled (FTS-only)",
+                collection_id,
+            )
+            with db.immediate_transaction(conn):
+                _flip_config(conn)
     except Exception:
         _set_migration_state(conn, collection_id, "failed")
         raise
+
+    # After the swap the new embedder is live. A chunk inserted between the
+    # last top-up and the swap had its vector only in the OLD live table
+    # (dropped by the swap): embed it now. Failure here leaves a consistent
+    # index with a few chunks reachable through FTS only — logged, not fatal.
+    caught_up = 0
+    if vec_ready:
+        try:
+            live_table = db.vec_table_name(collection_id)
+            missing = _missing_vector_chunks(conn, collection_id, live_table)
+            if missing:
+                caught_up = _embed_into(conn, live_table, missing, new_cfg, batch_size)
+        except Exception:  # noqa: BLE001
+            logger.warning("reindex catch-up embed failed for collection %s", collection_id, exc_info=True)
+    return {
+        "status": "done", "chunks_embedded": embedded_count + caught_up, "chunks_caught_up": caught_up,
+        "vector_index_ready": vec_ready,
+    }

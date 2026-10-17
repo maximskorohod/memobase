@@ -187,7 +187,9 @@ def _vector_search(
     mid-migration, or query embedding fails for any reason — all are
     "degrade to FTS-only for this call" conditions, not errors."""
     migration_state = collection_cfg.get("migration_state") or "idle"
-    if migration_state not in ("idle", None):
+    # 'failed' = a reindex aborted BEFORE its atomic swap: the live vec table
+    # and the collection's embedder columns are still the consistent old pair.
+    if migration_state not in ("idle", "failed", None):
         logger.info("retrieve: collection mid-migration (state=%r); skipping vector leg", migration_state)
         return []
 
@@ -352,7 +354,7 @@ def hybrid_search(
         return []
 
     migration_state = cfg.get("migration_state") or "idle"
-    degraded = migration_state not in ("idle", None)
+    degraded = migration_state not in ("idle", "failed", None)
     degraded_reason = "migrating" if degraded else None
 
     rerank_input_ids = fused_order[:RERANK_INPUT_MAX]

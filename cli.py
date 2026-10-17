@@ -146,7 +146,9 @@ def _handle(args) -> None:
                 print(f"Коллекция «{args.collection}» не найдена.")
                 return
             memobase_cfg = kb_config.get_memobase_config_readonly()
-            new_cfg = kb_config.get_collection_cfg(row, memobase_cfg=memobase_cfg)
+            # Target = the GLOBAL memobase.embedder (the row's stored columns
+            # describe the OLD embedder being replaced).
+            new_cfg = embed_mod.reindex_target_cfg(row, memobase_cfg)
             print(f"Переиндексация коллекции «{args.collection}» начата (embed_signature: {embed_mod.embedding_signature(new_cfg)})...")
             result = embed_mod.reembed_collection_shadow(conn, row, new_cfg)
             print(

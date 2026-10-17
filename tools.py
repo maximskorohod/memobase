@@ -881,7 +881,10 @@ def _format_ask_result(result: Dict[str, Any], collection_name: str) -> str:
     if result.get("near_miss"):
         lines.append("\n(Слабое совпадение с базой — проверьте ответ внимательно.)")
     if result.get("degraded"):
-        lines.append(f"\n(Внимание: ответ в деградированном режиме — {result.get('mode')}.)")
+        if result.get("mode") == "migrating":
+            lines.append("\n(Коллекция переиндексируется — ответы временно недоступны.)")
+        else:
+            lines.append(f"\n(Внимание: ответ в деградированном режиме — {result.get('mode')}.)")
     return "\n".join(lines)
 
 

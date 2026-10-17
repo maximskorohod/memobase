@@ -379,7 +379,15 @@ def answer(
         }
 
     migration_state = cfg.get("migration_state") or "idle"
-    if migration_state not in ("idle", None):
+    notice = None
+    if migration_state == "failed":
+        # A failed reindex leaves the previous live index intact (the swap is
+        # atomic) — keep answering from it, but say so honestly.
+        notice = (
+            "последняя переиндексация этой коллекции не удалась — поиск идёт по прежнему индексу; "
+            "повторите `hermes memobase reindex`"
+        )
+    elif migration_state not in ("idle", None):
         return {
             "answer": (
                 f"База знаний «{collection_name}» сейчас переиндексируется "
@@ -482,6 +490,8 @@ def answer(
     for cit in failed_citations:
         gaps.append(f"ссылка на фрагмент {cit.get('chunk_id')} не подтвердилась дословной цитатой и была исключена")
 
+    if notice:
+        gaps.append(notice)
     return {
         "answer": parsed.get("answer", "").strip() or "Ответ не сформирован.",
         "citations": verified_citations,

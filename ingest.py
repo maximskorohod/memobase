@@ -53,6 +53,11 @@ from . import youtube as youtube_mod
 logger = logging.getLogger("memobase.ingest")
 
 
+class _EmbedderChanged(Exception):
+    """The collection's embedder changed (reindex) while this ingest was
+    embedding — its vectors belong to the old model; abort the write."""
+
+
 class IngestError(RuntimeError):
     """Raised only for programmer-error-shaped misuse (malformed
     ``collection_row``). Normal ingest failures (bad source, budget
@@ -304,7 +309,7 @@ def ingest_source(
         return {"status": "failed", "error": reason, "job_id": job_id, **extra}
 
     migration_state = collection_cfg.get("migration_state") or "idle"
-    if migration_state not in ("idle", None):
+    if migration_state not in ("idle", "failed", None):
         return _fail(
             f"collection {collection_row['name']!r} is mid-migration "
             f"(migration_state={migration_state!r}); ingest refused until it completes"
@@ -556,6 +561,18 @@ def ingest_source(
         # DDL (CREATE VIRTUAL TABLE) stays outside the data transaction.
         vec_ready = bool(to_embed) and bool(dims) and db.ensure_vec_table(conn, collection_id, dims)
         with db.immediate_transaction(conn):
+            # Re-check under the write lock: a reindex that swapped the
+            # vector table while we were embedding would otherwise receive
+            # vectors from the OLD model.
+            live = conn.execute(
+                "SELECT embedder_provider, embedder_model, embedder_dims, migration_state "
+                "FROM collections WHERE id = ?", (collection_id,),
+            ).fetchone()
+            if live is None or (live["migration_state"] or "idle") not in ("idle", "failed") or (
+                kb_config.get_collection_cfg(dict(collection_row, **dict(live)), memobase_cfg=memobase_cfg)["embedder"]
+                != collection_cfg["embedder"]
+            ):
+                raise _EmbedderChanged()
             if existing_doc is not None:
                 document_id = existing_doc["id"]
                 conn.execute(
@@ -628,6 +645,8 @@ def ingest_source(
                 tombstoned_ids = _purge_removed_chunks_in_tx(
                     conn, collection_id=collection_id, document_id=document_id, keep_hashes=keep_hashes
                 )
+    except _EmbedderChanged:
+        return _fail("коллекция переиндексируется (сменилась модель эмбеддингов) — повторите загрузку позже")
     except (sqlite3.Error, db.DbError) as exc:
         # Nothing of this document was committed (rolled back above); the
         # embed spend already recorded stays in the ledger (it was paid).

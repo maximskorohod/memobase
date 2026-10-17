@@ -534,6 +534,20 @@ def vec_table_name(collection_id: int, *, shadow: bool = False) -> str:
     return name
 
 
+_vec_unavailable_warned = False
+
+
+def _warn_vec_unavailable_once(msg: str, *args: Any) -> None:
+    """Every connection tries to load sqlite-vec; without it that used to log
+    a WARNING per connection (i.e. per tool call). Warn once per process."""
+    global _vec_unavailable_warned
+    if _vec_unavailable_warned:
+        logger.debug(msg, *args)
+        return
+    _vec_unavailable_warned = True
+    logger.warning(msg, *args)
+
+
 def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     """Load the sqlite-vec extension into *conn*. Returns False (never
     raises) if the ``sqlite_vec`` Python package is not installed or the
@@ -544,7 +558,7 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     try:
         import sqlite_vec  # optional dependency; heavy/native import kept local
     except ImportError:
-        logger.warning("sqlite-vec package not installed; vector search disabled (FTS-only)")
+        _warn_vec_unavailable_once("sqlite-vec package not installed; vector search disabled (FTS-only)")
         return False
 
     try:
@@ -554,7 +568,7 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
         finally:
             conn.enable_load_extension(False)
     except (sqlite3.Error, AttributeError, OSError) as exc:
-        logger.warning("sqlite-vec extension failed to load: %s", exc)
+        _warn_vec_unavailable_once("sqlite-vec extension failed to load: %s", exc)
         return False
     return True
 
@@ -713,7 +727,7 @@ def safe_drop_vec_table(conn: sqlite3.Connection, table: str) -> None:
         )
 
 
-def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int) -> None:
+def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int, *, in_tx: Any = None) -> None:
     """Atomically promote the shadow table (``vec_c{id}_v2``) to live
     (``vec_c{id}``), for the embedding-migration flow.
 
@@ -735,6 +749,11 @@ def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int) -> N
     ``ensure_vec_table(..., shadow=True)`` for this same migration); there
     is no reliable way to introspect a vec0 table's declared dimensionality
     from SQL, so it must be passed in explicitly rather than re-derived.
+
+    *in_tx*: optional ``callable(conn)`` run INSIDE the same transaction,
+    after the copy — embed.py flips the collection's embedder columns and
+    chunk signatures there, so the live vectors and the config describing
+    them can never disagree after a crash.
     """
     if not isinstance(dims, int) or dims <= 0:
         raise DbError(f"invalid dims for vec table swap: {dims!r}")
@@ -760,6 +779,8 @@ def swap_vec_table(conn: sqlite3.Connection, collection_id: int, dims: int) -> N
                 f"SELECT chunk_id, embedding FROM {shadow}"
             )
             safe_drop_vec_table(conn, shadow)
+            if in_tx is not None:
+                in_tx(conn)
     except sqlite3.Error as exc:
         raise DbError(f"failed to swap vec tables for collection {collection_id}: {exc}") from exc
 
