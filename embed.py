@@ -116,6 +116,7 @@ def _request_with_backoff(
     json_body: Optional[dict] = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     max_retries: int = MAX_RETRIES,
+    retry_statuses: Sequence[int] = _RETRYABLE_STATUS,
 ):
     import requests  # heavy/optional import kept local
 
@@ -133,7 +134,7 @@ def _request_with_backoff(
             attempt += 1
             continue
 
-        if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
+        if resp.status_code in retry_statuses and attempt < max_retries:
             time.sleep(min(2 ** attempt, 30))
             attempt += 1
             continue

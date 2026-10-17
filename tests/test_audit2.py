@@ -598,3 +598,30 @@ class TestCostControl:
             assert res["video_count"] == 2 and res["videos_capped"] is True and len(seen) == 2
         finally:
             conn.close()
+
+
+# ===========================================================================
+# 11. Cohere 429: no retry, circuit breaker
+# ===========================================================================
+
+
+class TestRerankBreaker:
+    def test_429_not_retried_and_opens_breaker(self, kb, monkeypatch):
+        monkeypatch.setenv("COHERE_API_KEY", "k")
+        calls = []
+
+        class R:
+            status_code = 429
+            text = ""
+
+        def fake(method, url, **kw):
+            calls.append(kw)
+            return R()
+
+        monkeypatch.setattr(kb.embed, "_request_with_backoff", fake)
+        cands = [{"chunk_id": 1, "text": "a", "rrf_score": 0.1, "_rrf_rank": 1}]
+        ranked, mode = kb.rerank.rerank("q", cands, {"rerank": {"enabled": True}})
+        assert mode == "rrf-only" and len(calls) == 1
+        assert 429 not in calls[0]["retry_statuses"]
+        ranked, mode = kb.rerank.rerank("q", cands, {"rerank": {"enabled": True}})
+        assert mode == "rrf-only" and len(calls) == 1  # breaker open: Cohere not hit again

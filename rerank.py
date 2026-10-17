@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import db
@@ -47,6 +49,30 @@ DOCS_PER_SEARCH_UNIT = 100
 MAX_DOC_CHARS = 6000
 
 COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
+
+# Cohere 429 (trial: 10 req/min) is NOT retried — a user's question must not
+# wait through exponential backoff for a reranker that is rate-limited. The
+# call degrades to rrf-only at once and a process-level circuit breaker keeps
+# every following query on rrf-only for CIRCUIT_OPEN_S, without hitting Cohere.
+CIRCUIT_OPEN_S = 60.0
+_RETRY_STATUSES = (500, 502, 503, 504)
+_breaker_lock = threading.Lock()
+_breaker_open_until = 0.0
+
+
+class RerankRateLimited(RuntimeError):
+    """Cohere answered 429."""
+
+
+def _breaker_is_open() -> bool:
+    with _breaker_lock:
+        return time.monotonic() < _breaker_open_until
+
+
+def _open_breaker(seconds: float = CIRCUIT_OPEN_S) -> None:
+    global _breaker_open_until
+    with _breaker_lock:
+        _breaker_open_until = max(_breaker_open_until, time.monotonic() + seconds)
 
 
 class RerankError(RuntimeError):
@@ -77,8 +103,10 @@ def _cohere_rerank(query: str, documents: List[str], *, model: str, api_key: str
     # identical retry semantics (429/5xx, capped exponential backoff).
     resp = embed_mod._request_with_backoff(
         "POST", COHERE_RERANK_URL, headers=headers, json_body=body,
-        timeout=DEFAULT_TIMEOUT_S, max_retries=MAX_RETRIES,
+        timeout=DEFAULT_TIMEOUT_S, max_retries=1, retry_statuses=_RETRY_STATUSES,
     )
+    if resp.status_code == 429:
+        raise RerankRateLimited("Cohere rerank rate-limited (HTTP 429)")
     if resp.status_code != 200:
         logger.debug("Cohere rerank failed: HTTP %s body=%s", resp.status_code, resp.text[:500])
         raise RerankError(f"Cohere rerank call failed: HTTP {resp.status_code}")
@@ -150,6 +178,10 @@ def rerank(
         logger.info("rerank: COHERE_API_KEY not set; degrading to rrf-only")
         return candidates, "rrf-only"
 
+    if _breaker_is_open():
+        logger.debug("rerank: circuit breaker open after a recent 429; rrf-only")
+        return candidates, "rrf-only"
+
     search_units = max(1, -(-len(candidates) // DOCS_PER_SEARCH_UNIT))  # ceil division
     estimated_usd = ledger.estimate_cost_usd("cohere", "rerank", search_units)
     if conn is not None:
@@ -167,6 +199,10 @@ def rerank(
 
     try:
         results = _cohere_rerank(query, documents, model=model, api_key=api_key)
+    except RerankRateLimited:
+        _open_breaker()
+        logger.warning("rerank: Cohere 429; rrf-only for the next %.0fs", CIRCUIT_OPEN_S)
+        return candidates, "rrf-only"
     except RerankError as exc:
         logger.warning("rerank: Cohere call failed (%s); degrading to rrf-only", exc)
         return candidates, "rrf-only"
