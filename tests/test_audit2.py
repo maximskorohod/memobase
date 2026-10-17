@@ -297,3 +297,53 @@ class TestIngestAtomic:
             assert res2["status"] == "done" and res2["chunks_added"] >= 1
         finally:
             conn.close()
+
+
+# ===========================================================================
+# 5. Sufficiency gate actually fires
+# ===========================================================================
+
+
+def _cand(text, *, mode, score, rerank=None, cid=1):
+    return {
+        "chunk_id": cid, "text": text, "score": score, "rerank_score": rerank, "mode": mode,
+        "source": "vector", "source_uri": "d.md", "title": None, "page_or_timecode": None,
+        "section": None, "degraded": False,
+    }
+
+
+class TestSufficiencyGate:
+    CFG = {"collection_name": "c", "rrf_threshold": None, "rerank_threshold": None, "migration_state": "idle"}
+
+    def test_rrf_only_unrelated_top_hit_refused(self, kb, fake_llm, monkeypatch):
+        # Vector-only nearest neighbour with zero lexical evidence: RRF score
+        # of rank #1 (~0.066) used to pass the 0.02 threshold unconditionally.
+        monkeypatch.setattr(kb.retrieve, "hybrid_search", lambda *a, **k: [
+            _cand("Гарантийный срок на товар составляет 24 месяца.", mode="rrf-only", score=0.0664),
+        ])
+        res = kb.answer.answer(None, 1, "рецепт борща со свёклой", self.CFG, llm=fake_llm)
+        assert res["refused"] is True and fake_llm.calls == []
+
+    def test_rrf_only_with_term_overlap_passes(self, kb, fake_llm, monkeypatch):
+        monkeypatch.setattr(kb.retrieve, "hybrid_search", lambda *a, **k: [
+            _cand("Гарантийный срок на товар составляет 24 месяца.", mode="rrf-only", score=0.0664),
+        ])
+        fake_llm.next_text = '{"answer": "24 месяца [chunk:1]", "citations": [{"chunk_id": 1, "quote": "Гарантийный срок на товар составляет 24 месяца"}]}'
+        res = kb.answer.answer(None, 1, "какой гарантийный срок у товара?", self.CFG, llm=fake_llm)
+        assert res["refused"] is False and fake_llm.calls
+
+    def test_cohere_gate_uses_raw_relevance_not_blend(self, kb, fake_llm, monkeypatch):
+        # Blended score 0.76 (top RRF hit) but Cohere says irrelevant (0.01).
+        monkeypatch.setattr(kb.retrieve, "hybrid_search", lambda *a, **k: [
+            _cand("Гарантийный срок 24 месяца.", mode="cohere", score=0.76, rerank=0.01),
+        ])
+        res = kb.answer.answer(None, 1, "рецепт борща", self.CFG, llm=fake_llm)
+        assert res["refused"] is True and fake_llm.calls == []
+
+    def test_cohere_near_miss_band(self, kb, fake_llm, monkeypatch):
+        monkeypatch.setattr(kb.retrieve, "hybrid_search", lambda *a, **k: [
+            _cand("Гарантийный срок 24 месяца.", mode="cohere", score=0.76, rerank=0.12),
+        ])
+        fake_llm.next_text = '{"answer": "24 [chunk:1]", "citations": [{"chunk_id": 1, "quote": "Гарантийный срок 24 месяца"}]}'
+        res = kb.answer.answer(None, 1, "гарантийный срок", self.CFG, llm=fake_llm)
+        assert res["near_miss"] is True and fake_llm.calls

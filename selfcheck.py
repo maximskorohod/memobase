@@ -33,6 +33,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from . import answer as answer_mod
 from . import retrieve as retrieve_mod
 
 logger = logging.getLogger("memobase.selfcheck")
@@ -163,7 +164,10 @@ def run_selfcheck(
             if cand["chunk_id"] == c["chunk_id"]:
                 found = True
                 rank = r
-                score = cand["score"]
+                # Calibrate on the SAME signal answer.py's gate compares
+                # (raw rerank relevance / lexical coverage), not the blended
+                # retrieval score.
+                score = answer_mod.sufficiency_signal(query, candidates)[1]
                 break
 
         if found:

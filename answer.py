@@ -18,10 +18,14 @@ this module trivially unit-testable with a fake ``llm.complete()`` stub.
 Four-layer "no hallucinations" contour:
 
 1. **Sufficiency gate BEFORE generation** — two separate, mode-specific
-   thresholds (``rerank_threshold`` for ``mode=='cohere'``,
-   ``rrf_threshold`` for ``mode=='rrf-only'`` — a single threshold is
-   either always-refuse or always-pass
-   for whichever mode it wasn't calibrated for). Below
+   signals and thresholds (:func:`sufficiency_signal`): for
+   ``mode=='cohere'`` the RAW Cohere relevance of the best candidate vs
+   ``rerank_threshold`` (NOT the blended score — after the positional blend
+   the top RRF hit always scores >= 0.75, so the gate never fired); for
+   ``mode=='rrf-only'`` the share of the question's content terms actually
+   present in the top candidates vs ``rrf_threshold`` (an RRF score is
+   rank-derived — rank #1 always gets >= 0.066 — so it carries no
+   relevance evidence at all). Below
    ``threshold * NEAR_MISS_BAND`` → hard refusal, no generation call at
    all (arXiv 2411.06037: retrieved context makes a model LESS willing to
    refuse, so the gate must run before the model ever sees the chunks).
@@ -71,7 +75,10 @@ logger = logging.getLogger("memobase.answer")
 # top-rank bonus) are numerically tiny by construction, hence the much
 # smaller RRF default.
 DEFAULT_RERANK_THRESHOLD = 0.15
-DEFAULT_RRF_THRESHOLD = 0.02
+# rrf-only mode gates on lexical evidence (share of the question's content
+# terms found in the best of the top candidates, 0..1), not on the RRF score.
+DEFAULT_RRF_THRESHOLD = 0.34
+LEXICAL_TOP_N = 3
 NEAR_MISS_BAND = 0.7  # fraction of threshold below which it's a hard refusal, not a near-miss
 FUZZY_QUOTE_THRESHOLD = 0.82
 SUBCLAIM_COVERAGE_THRESHOLD = 0.4
@@ -112,6 +119,69 @@ def decompose_subclaims(query: str) -> List[str]:
     returns at least one item (the whole query) if no delimiter is found."""
     parts = [p.strip(" \t\n.!") for p in _SUBCLAIM_SPLIT_RE.split(query or "") if p.strip(" \t\n.!")]
     return parts if parts else ([query.strip()] if query and query.strip() else [])
+
+
+# ---------------------------------------------------------------------------
+# Sufficiency signal (the pre-generation gate's input)
+# ---------------------------------------------------------------------------
+
+# Function words that carry no topical evidence (RU + EN). Raw lowercase
+# forms; matched before stemming.
+_STOPWORDS = frozenset("""
+а без более бы был была были было быть в вам вас весь во вот все всего всех вы где да даже для до его
+ее её если есть еще ещё же за здесь и из или им их к как какая какие каким какой какое каков какова
+когда кто ли либо мне может можно мы на над надо наш не него нее неё нет ни них но ну о об однако он она
+они оно от очень по под при про с со так также такой там те тем то того тоже той только том ты у уже
+хотя чего чей чем что чтобы чье чьё эта эти это этот я ли сколько почему зачем откуда куда
+a an and are as at be by can do does for from how i in is it of on or that the this to was what when
+where which who why with you your
+""".split())
+
+_EDGE_PUNCT_RE = re.compile(r"^[^\w]+|[^\w]+$", re.UNICODE)
+
+
+def _query_terms(query: str) -> "set":
+    terms = set()
+    for raw in (query or "").lower().split():
+        tok = _EDGE_PUNCT_RE.sub("", raw)
+        if not tok or tok in _STOPWORDS:
+            continue
+        if any(ch.isdigit() for ch in tok):
+            terms.add(tok)  # coded/numeric token: matched raw, not stemmed
+            continue
+        for s in stem_mod.stem_ru(tok).split():
+            if len(s) > 2 and s not in _STOPWORDS:
+                terms.add(s)
+    return terms
+
+
+def lexical_coverage(query: str, candidates: List[Dict[str, Any]], *, top_n: int = LEXICAL_TOP_N) -> float:
+    """Best share (0..1) of *query*'s content terms present in any one of the
+    top *top_n* candidates' RAW text (stemmed here, not the FTS shadow
+    column). 0.0 when the question has no content terms at all."""
+    q_terms = _query_terms(query)
+    if not q_terms:
+        return 0.0
+    best = 0.0
+    for c in candidates[:top_n]:
+        text = (c.get("text") or "").lower()
+        stems = set(stem_mod.stem_ru(text).split())
+        hit = sum(1 for t in q_terms if (t in stems) or (any(ch.isdigit() for ch in t) and t in text))
+        best = max(best, hit / len(q_terms))
+    return best
+
+
+def sufficiency_signal(query: str, candidates: List[Dict[str, Any]]) -> "tuple[str, float]":
+    """``(mode, signal)`` the sufficiency gate compares with the mode's
+    threshold. cohere: max RAW rerank relevance among candidates (falls back
+    to the candidate score when no rerank score is present); rrf-only:
+    :func:`lexical_coverage`. Shared with selfcheck.py's calibration so the
+    suggested thresholds are on the same scale the gate uses."""
+    mode = candidates[0].get("mode") or "rrf-only"
+    if mode == "cohere":
+        raw = [float(c["rerank_score"]) for c in candidates if c.get("rerank_score") is not None]
+        return mode, (max(raw) if raw else float(candidates[0].get("score") or 0.0))
+    return mode, lexical_coverage(query, candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +393,7 @@ def answer(
             "refused": True, "degraded": False, "near_miss": False,
         }
 
-    mode = candidates[0]["mode"]
-    top_score = candidates[0]["score"]
+    mode, top_score = sufficiency_signal(query, candidates)
     threshold = cfg.get("rerank_threshold") if mode == "cohere" else cfg.get("rrf_threshold")
     if threshold is None:
         threshold = DEFAULT_RERANK_THRESHOLD if mode == "cohere" else DEFAULT_RRF_THRESHOLD
