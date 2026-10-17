@@ -147,3 +147,68 @@ class TestInjectionIndexMapping:
             assert [q["chunk_index"] for q in pending] == [2]
         finally:
             conn.close()
+
+
+# ===========================================================================
+# 3. Secrets never in URLs / error text
+# ===========================================================================
+
+
+class TestSecretsNotInUrls:
+    def test_gemini_key_sent_as_header_not_query(self, kb, monkeypatch, tmp_path):
+        audio = tmp_path / "a.flac"
+        audio.write_bytes(b"bytes")
+        monkeypatch.setenv("GEMINI_API_KEY", "gem-secret-123")
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "[00:01] hi"}]}}]}
+
+        def fake(method, url, **kw):
+            seen["url"] = url
+            seen["headers"] = kw.get("headers") or {}
+            return FakeResp()
+
+        monkeypatch.setattr(kb.stt, "_request_with_backoff", fake)
+        kb.stt.transcribe_gemini(str(audio))
+        assert "gem-secret-123" not in seen["url"]
+        assert seen["headers"].get("x-goog-api-key") == "gem-secret-123"
+
+    def test_apify_token_sent_as_bearer_header(self, kb, monkeypatch):
+        monkeypatch.setenv("APIFY_TOKEN", "apify-secret-xyz")
+        calls = []
+
+        class FakeResp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+                self.text = ""
+
+            def json(self):
+                return self._payload
+
+        def fake(method, url, **kw):
+            calls.append((url, kw))
+            if url.endswith("/runs"):
+                return FakeResp(201, {"data": {"id": "r1", "defaultDatasetId": "d1"}})
+            if "/actor-runs/" in url:
+                return FakeResp(200, {"data": {"status": "SUCCEEDED", "defaultDatasetId": "d1"}})
+            return FakeResp(200, [{"id": "v"}])
+
+        monkeypatch.setattr(kb.youtube, "_request_with_backoff", fake)
+        kb.youtube._apify_run_actor("actor~x", {}, poll_interval_s=0)
+        for url, kw in calls:
+            assert "apify-secret-xyz" not in url
+            assert "apify-secret-xyz" not in str(kw.get("params"))
+            assert kw["headers"]["Authorization"] == "Bearer apify-secret-xyz"
+
+    def test_request_error_text_has_only_host(self, kb):
+        msg = kb.security.describe_request_error(
+            "https://api.cloudflare.com/client/v4/accounts/ACCT123/ai/run/m?key=SECRET", ValueError("boom ACCT123"),
+        )
+        assert "ACCT123" not in msg and "SECRET" not in msg
+        assert "api.cloudflare.com" in msg and "ValueError" in msg

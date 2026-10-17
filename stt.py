@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .secrets import get_env
-from .security import DEFAULT_USER_AGENT
+from .security import DEFAULT_USER_AGENT, describe_request_error
 
 logger = logging.getLogger("memobase.stt")
 
@@ -52,7 +52,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MAX_BYTES = 25 * 1024 * 1024
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_URL_TMPL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
 
 CHUNK_MINUTES = 20
@@ -181,7 +181,9 @@ def _request_with_backoff(method: str, url: str, *, headers: Optional[Dict[str, 
             )
         except requests.RequestException as exc:
             if attempt >= max_retries:
-                raise SttError(f"request to {url} failed after {attempt} retries: {exc}") from exc
+                raise SttError(
+                    f"request failed after {attempt} retries: {describe_request_error(url, exc)}"
+                ) from exc
             time.sleep(min(2 ** attempt, 30))
             attempt += 1
             continue
@@ -282,8 +284,12 @@ def transcribe_gemini(audio_path: str) -> List[Dict[str, Any]]:
             {"parts": [{"text": prompt}, {"inline_data": {"mime_type": mime, "data": b64}}]}
         ]
     }
-    url = GEMINI_URL_TMPL.format(model=GEMINI_MODEL, key=api_key)
-    resp = _request_with_backoff("POST", url, json_body=body, timeout=300.0)
+    # Key in a header, never in the URL query: requests puts the full URL
+    # into its exception text, which would otherwise leak into errors/logs.
+    url = GEMINI_URL_TMPL.format(model=GEMINI_MODEL)
+    resp = _request_with_backoff(
+        "POST", url, headers={"x-goog-api-key": api_key}, json_body=body, timeout=300.0
+    )
     if resp.status_code != 200:
         # See transcribe_groq's identical note -- raw provider body only to
         # debug log, never into the user-facing exception message.

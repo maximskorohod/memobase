@@ -143,6 +143,21 @@ def check_url(url: str) -> None:
     _check_host(host)
 
 
+def url_host(url: str) -> str:
+    """Host part of *url* only — for error/log text that must never carry a
+    full URL (query-string tokens, account ids in the path, signed links)."""
+    try:
+        return urllib.parse.urlsplit(str(url)).hostname or "?"
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def describe_request_error(url: str, exc: BaseException) -> str:
+    """Safe one-line description of a failed HTTP call: exception type +
+    host, never the exception text (requests embeds the full URL in it)."""
+    return f"{type(exc).__name__} при обращении к {url_host(url)}"
+
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 memobase/0.1"

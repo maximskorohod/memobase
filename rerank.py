@@ -78,14 +78,15 @@ def _cohere_rerank(query: str, documents: List[str], *, model: str, api_key: str
         timeout=DEFAULT_TIMEOUT_S, max_retries=MAX_RETRIES,
     )
     if resp.status_code != 200:
-        raise RerankError(f"Cohere rerank call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        logger.debug("Cohere rerank failed: HTTP %s body=%s", resp.status_code, resp.text[:500])
+        raise RerankError(f"Cohere rerank call failed: HTTP {resp.status_code}")
     try:
         payload = resp.json()
     except ValueError as exc:
         raise RerankError(f"Cohere rerank response was not JSON: {exc}") from exc
     results = payload.get("results")
     if not isinstance(results, list):
-        raise RerankError(f"Cohere rerank response missing results[]: {str(payload)[:500]}")
+        raise RerankError("Cohere rerank response missing results[]")
     return results
 
 

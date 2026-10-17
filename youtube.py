@@ -76,7 +76,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .secrets import get_env
-from .security import DEFAULT_USER_AGENT, safe_get
+from .security import DEFAULT_USER_AGENT, describe_request_error, safe_get
 
 logger = logging.getLogger("memobase.youtube")
 
@@ -206,7 +206,9 @@ def _request_with_backoff(method: str, url: str, *, headers: Optional[Dict[str, 
             )
         except requests.RequestException as exc:
             if attempt >= max_retries:
-                raise YoutubeError(f"request to {url} failed after {attempt} retries: {exc}") from exc
+                raise YoutubeError(
+                    f"request failed after {attempt} retries: {describe_request_error(url, exc)}"
+                ) from exc
             time.sleep(min(2 ** attempt, 30))
             attempt += 1
             continue
@@ -235,7 +237,8 @@ def _sc_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     headers = {"x-api-key": _sc_api_key()}
     resp = _request_with_backoff("GET", url, headers=headers, params=params)
     if resp.status_code != 200:
-        raise YoutubeError(f"ScrapeCreators {path} failed: HTTP {resp.status_code}: {resp.text[:300]}")
+        logger.debug("ScrapeCreators %s failed: HTTP %s body=%s", path, resp.status_code, resp.text[:300])
+        raise YoutubeError(f"ScrapeCreators {path} failed: HTTP {resp.status_code}")
     try:
         return resp.json()
     except ValueError as exc:
@@ -314,11 +317,14 @@ def _apify_run_actor(actor_id: str, run_input: Dict[str, Any], *, poll_interval_
     limit; poll every 5-10s; client-side timeout 30-60min; PPR actors don't
     charge for failed items so retries are free). Raises
     :class:`YoutubeError` on submit failure, run failure, or timeout."""
-    token = _apify_token()
+    # Token in the Authorization header, never in the query string (requests
+    # embeds the full URL in its exception text).
+    auth = {"Authorization": f"Bearer {_apify_token()}"}
     submit_url = f"{APIFY_BASE}/acts/{actor_id}/runs"
-    resp = _request_with_backoff("POST", submit_url, params={"token": token}, json_body=run_input)
+    resp = _request_with_backoff("POST", submit_url, headers=auth, json_body=run_input)
     if resp.status_code not in (200, 201):
-        raise YoutubeError(f"Apify actor {actor_id} run submission failed: HTTP {resp.status_code}: {resp.text[:300]}")
+        logger.debug("Apify %s submit failed: HTTP %s body=%s", actor_id, resp.status_code, resp.text[:300])
+        raise YoutubeError(f"Apify actor {actor_id} run submission failed: HTTP {resp.status_code}")
     try:
         run = resp.json()["data"]
     except (ValueError, KeyError) as exc:
@@ -332,7 +338,7 @@ def _apify_run_actor(actor_id: str, run_input: Dict[str, Any], *, poll_interval_
     status_url = f"{APIFY_BASE}/actor-runs/{run_id}"
     dataset_id = run.get("defaultDatasetId")
     while True:
-        resp = _request_with_backoff("GET", status_url, params={"token": token})
+        resp = _request_with_backoff("GET", status_url, headers=auth)
         if resp.status_code != 200:
             raise YoutubeError(f"Apify run {run_id} status poll failed: HTTP {resp.status_code}")
         data = resp.json().get("data", {})
@@ -349,7 +355,7 @@ def _apify_run_actor(actor_id: str, run_input: Dict[str, Any], *, poll_interval_
     if not dataset_id:
         raise YoutubeError(f"Apify actor {actor_id} run {run_id} succeeded but has no defaultDatasetId")
     items_url = f"{APIFY_BASE}/datasets/{dataset_id}/items"
-    resp = _request_with_backoff("GET", items_url, params={"token": token, "format": "json"})
+    resp = _request_with_backoff("GET", items_url, headers=auth, params={"format": "json"})
     if resp.status_code != 200:
         raise YoutubeError(f"Apify dataset {dataset_id} fetch failed: HTTP {resp.status_code}")
     try:
@@ -729,7 +735,8 @@ def download_audio_apify(video_id: str) -> Tuple[bytes, str]:
         item.get("audioFileUrl") or item.get("mp3Url") or item.get("audioUrl") or item.get("downloadUrl")
     )
     if not audio_url:
-        raise YoutubeError(f"Apify audio actor result for video {video_id} has no audio URL: {item!r}")
+        logger.debug("Apify audio actor item without audio URL: %r", item)
+        raise YoutubeError(f"Apify audio actor result for video {video_id} has no audio URL")
     # The audio URL is a first-party Apify KV-store link, not owner-supplied
     # untrusted input, but security.safe_get's SSRF guard + size cap + retry/
     # backoff is exactly the right shared primitive for "download a file from

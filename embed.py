@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import db
 from .secrets import get_env
-from .security import DEFAULT_USER_AGENT
+from .security import DEFAULT_USER_AGENT, describe_request_error
 
 logger = logging.getLogger("memobase.embed")
 
@@ -126,7 +126,9 @@ def _request_with_backoff(
             resp = requests.request(method, url, headers=req_headers, json=json_body, timeout=timeout)
         except requests.RequestException as exc:
             if attempt >= max_retries:
-                raise EmbedError(f"request to {url} failed after {attempt} retries: {exc}") from exc
+                raise EmbedError(
+                    f"request failed after {attempt} retries: {describe_request_error(url, exc)}"
+                ) from exc
             time.sleep(min(2 ** attempt, 30))
             attempt += 1
             continue
@@ -158,16 +160,18 @@ def _embed_cloudflare(texts: List[str], model: str) -> List[List[float]]:
         batch = texts[start : start + BATCH_SIZE]
         resp = _request_with_backoff("POST", url, headers=headers, json_body={"text": batch})
         if resp.status_code != 200:
-            raise EmbedError(f"Cloudflare embed call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+            logger.debug("Cloudflare embed failed: HTTP %s body=%s", resp.status_code, resp.text[:500])
+            raise EmbedError(f"Cloudflare embed call failed: HTTP {resp.status_code}")
         try:
             payload = resp.json()
         except ValueError as exc:
             raise EmbedError(f"Cloudflare embed response was not JSON: {exc}") from exc
         if payload.get("success") is False:
-            raise EmbedError(f"Cloudflare embed call reported failure: {payload.get('errors')}")
+            logger.debug("Cloudflare embed reported failure: %s", payload.get("errors"))
+            raise EmbedError("Cloudflare embed call reported failure (success=false)")
         data = (payload.get("result") or {}).get("data")
         if data is None:
-            raise EmbedError(f"Cloudflare embed response missing result.data: {str(payload)[:500]}")
+            raise EmbedError("Cloudflare embed response missing result.data")
         all_vectors.extend(data)
     return all_vectors
 
@@ -185,14 +189,15 @@ def _embed_openai_compat(
         batch = texts[start : start + BATCH_SIZE]
         resp = _request_with_backoff("POST", url, headers=headers, json_body={"input": batch, "model": model})
         if resp.status_code != 200:
-            raise EmbedError(f"OpenAI-compat embed call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+            logger.debug("OpenAI-compat embed failed: HTTP %s body=%s", resp.status_code, resp.text[:500])
+            raise EmbedError(f"OpenAI-compat embed call failed: HTTP {resp.status_code}")
         try:
             payload = resp.json()
         except ValueError as exc:
             raise EmbedError(f"OpenAI-compat embed response was not JSON: {exc}") from exc
         items = payload.get("data")
         if not isinstance(items, list):
-            raise EmbedError(f"OpenAI-compat embed response missing data[]: {str(payload)[:500]}")
+            raise EmbedError("OpenAI-compat embed response missing data[]")
         try:
             ordered = sorted(items, key=lambda it: it.get("index", 0))
             all_vectors.extend(it["embedding"] for it in ordered)
