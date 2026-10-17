@@ -315,13 +315,16 @@ def parse_llm_output(raw_text: str) -> Dict[str, Any]:
 def _build_context_block(candidates: List[Dict[str, Any]]) -> str:
     parts = []
     for c in candidates:
-        label = f"[chunk:{c['chunk_id']}] источник: {c.get('source_uri') or c.get('title') or 'неизвестен'}"
+        # Only the chunk id (ours) stays outside the fence; source path, page
+        # and section heading come from the uploaded document and are
+        # untrusted — they go inside it.
+        meta = f"источник: {c.get('source_uri') or c.get('title') or 'неизвестен'}"
         if c.get("page_or_timecode"):
-            label += f", стр./время: {c['page_or_timecode']}"
+            meta += f", стр./время: {c['page_or_timecode']}"
         if c.get("section"):
-            label += f", раздел: {c['section']}"
-        fenced = security.fence_untrusted(c["text"], source=str(c.get("source_uri") or "memobase"))
-        parts.append(f"{label}\n{fenced}")
+            meta += f", раздел: {c['section']}"
+        fenced = security.fence_untrusted(c["text"], source=str(c.get("source_uri") or "memobase"), meta=meta)
+        parts.append(f"[chunk:{c['chunk_id']}]\n{fenced}")
     return "\n\n".join(parts)
 
 

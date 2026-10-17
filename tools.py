@@ -808,10 +808,12 @@ def memobase_query(args: Dict[str, Any], **kwargs: Any) -> str:
     chunk_target = int(((collection_cfg.get("chunk") or {}).get("target_tokens")) or 900)
     for c in candidates:
         header = f"[chunk:{c['chunk_id']}] score={c['score']:.4f} source={c['source']} mode={c['mode']}"
+        # source_uri / page are document-derived (untrusted) — inside the fence.
+        meta_parts = []
         if c.get("source_uri"):
-            header += f" | {c['source_uri']}"
+            meta_parts.append(f"источник: {c['source_uri']}")
         if c.get("page_or_timecode"):
-            header += f" стр./время: {c['page_or_timecode']}"
+            meta_parts.append(f"стр./время: {c['page_or_timecode']}")
         tok = chunk_mod.approx_tokens(c["text"])
         if tok > 2 * chunk_target:
             header += (
@@ -821,7 +823,9 @@ def memobase_query(args: Dict[str, Any], **kwargs: Any) -> str:
         # memobase_query feeds a PRIVILEGED caller (unlike memobase_ask's
         # isolated tool-less LLM) — every chunk MUST be fenced +
         # injection-scanned here, not just at ingest time.
-        blocks.append(header + "\n" + security.fence_untrusted(c["text"], source=str(c.get("source_uri") or "memobase")))
+        blocks.append(header + "\n" + security.fence_untrusted(
+            c["text"], source=str(c.get("source_uri") or "memobase"), meta=", ".join(meta_parts) or None,
+        ))
     return "\n\n".join(blocks)
 
 
