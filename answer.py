@@ -81,6 +81,11 @@ DEFAULT_RRF_THRESHOLD = 0.34
 LEXICAL_TOP_N = 3
 NEAR_MISS_BAND = 0.7  # fraction of threshold below which it's a hard refusal, not a near-miss
 FUZZY_QUOTE_THRESHOLD = 0.82
+# A "quote" of a word or two ("срок", "и") is found in almost any chunk and
+# proves nothing: require ~a phrase.
+MIN_QUOTE_CHARS = 20
+MIN_QUOTE_WORDS = 3
+MIN_QUOTE_CHARS_WITH_WORDS = 12
 SUBCLAIM_COVERAGE_THRESHOLD = 0.4
 DEFAULT_K = 8
 
@@ -212,6 +217,10 @@ def verify_quote(quote: str, chunk_text: str, *, threshold: float = FUZZY_QUOTE_
     nq = _normalize_for_match(quote)
     nc = _normalize_for_match(chunk_text)
     if not nq or not nc:
+        return False
+    if len(nq) < MIN_QUOTE_CHARS and not (
+        len(nq.split()) >= MIN_QUOTE_WORDS and len(nq) >= MIN_QUOTE_CHARS_WITH_WORDS
+    ):
         return False
     if nq in nc:
         return True
@@ -369,7 +378,9 @@ def answer(
     "couldn't answer" cases — only :class:`AnswerError` if *llm* is missing
     (a caller bug: ``tools.py`` must always pass ``ctx.llm``).
     """
-    query = (query or "").strip()
+    from . import normalize as normalize_mod
+
+    query = normalize_mod.normalize_query(query or "")
     collection_name = cfg.get("collection_name") or str(collection_id)
 
     if not query:

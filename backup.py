@@ -110,8 +110,11 @@ def rotate_backups(backup_dir: Path, keep: int) -> List[Path]:
     if keep < 0:
         keep = 0
     try:
+        # Only OUR snapshot names (snapshot_filename): a bare "*.db" would also
+        # match memobase.db itself (or anyone else's .db) if backup_dir ever
+        # pointed at a shared directory.
         candidates = sorted(
-            p for p in backup_dir.glob(f"*{_SNAPSHOT_SUFFIX}") if p.is_file()
+            p for p in backup_dir.glob(f"memobase-*{_SNAPSHOT_SUFFIX}") if p.is_file()
         )
     except OSError:
         logger.warning("backup: failed to list %s for rotation", backup_dir, exc_info=True)
@@ -198,6 +201,17 @@ def run_doctor(memobase_cfg: Optional[Dict[str, Any]] = None, *, db_path: Option
     if not source_db.exists():
         result["ok"] = False
         result["steps"]["snapshot"] = {"ok": False, "error": f"memobase.db not found at {source_db}"}
+        return result
+    try:
+        same_dir = Path(dest_dir).resolve() == Path(source_db).resolve().parent
+    except OSError:
+        same_dir = False
+    if same_dir:
+        result["ok"] = False
+        result["steps"]["snapshot"] = {
+            "ok": False,
+            "error": f"backup_dir совпадает с каталогом базы ({dest_dir}) — укажите отдельный каталог",
+        }
         return result
 
     snapshot_path = dest_dir / snapshot_filename()

@@ -796,3 +796,43 @@ class TestEmbedMigration:
             assert conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"] == 0
         finally:
             conn.close()
+
+
+# ===========================================================================
+# 14. Small hardening
+# ===========================================================================
+
+
+class TestSmallHardening:
+    def test_k_clamped(self, kb, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(kb.retrieve, "_fts_search", lambda conn, cid, q, limit: seen.setdefault("limit", limit) and [])
+        monkeypatch.setattr(kb.retrieve, "_vector_search", lambda *a, **k: [])
+        kb.retrieve.hybrid_search(None, 1, "запрос", 10_000, {})
+        assert seen["limit"] <= kb.retrieve.MAX_K * kb.retrieve.OVERFETCH_MULT
+
+    def test_query_normalized_like_ingest(self, kb):
+        assert kb.normalize.normalize_query("«gpt–4»  тест") == '"gpt-4" тест'
+
+    def test_verify_quote_rejects_trivial_quote(self, kb):
+        chunk = "Гарантийный срок на товар составляет 24 месяца с даты покупки."
+        assert kb.answer.verify_quote("срок", chunk) is False
+        assert kb.answer.verify_quote("на товар", chunk) is False
+        assert kb.answer.verify_quote("24 месяца с даты", chunk) is True
+        assert kb.answer.verify_quote("Гарантийный срок на товар", chunk) is True
+
+    def test_rotate_only_own_snapshots(self, kb, tmp_path):
+        (tmp_path / "memobase.db").write_text("live", encoding="utf-8")
+        (tmp_path / "other.db").write_text("x", encoding="utf-8")
+        for i in range(3):
+            (tmp_path / f"memobase-2026010{i}-000000.db").write_text("x", encoding="utf-8")
+        kb.backup.rotate_backups(tmp_path, keep=1)
+        names = sorted(p.name for p in tmp_path.glob("*.db"))
+        assert names == ["memobase-20260102-000000.db", "memobase.db", "other.db"]
+
+    def test_doctor_refuses_backup_dir_equal_db_dir(self, kb, tmp_path):
+        db_path = tmp_path / "memobase.db"
+        import sqlite3
+        sqlite3.connect(str(db_path)).close()
+        res = kb.backup.run_doctor({"backup": {}}, db_path=db_path, backup_dir=tmp_path)
+        assert res["ok"] is False and "совпадает" in res["steps"]["snapshot"]["error"]

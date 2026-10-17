@@ -225,6 +225,17 @@ def _step_normalize_quotes_dashes(text: str, counters: Dict[str, int]) -> str:
     return text.translate(_QUOTE_DASH_TABLE)
 
 
+def normalize_query(text: str) -> str:
+    """Query-side counterpart of the ingest pipeline's Unicode steps: NFC +
+    the same quote/dash map + whitespace collapse, so a query typed with
+    «ёлочки» / en-dashes / decomposed letters matches text that went through
+    :func:`normalize` at ingest time."""
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFC", text).translate(_QUOTE_DASH_TABLE)
+    return " ".join(text.split())
+
+
 # ---------------------------------------------------------------------------
 # Step 10: cross-block dedup
 # ---------------------------------------------------------------------------

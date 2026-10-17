@@ -72,6 +72,7 @@ OVERFETCH_MULT = 3
 TOP_RANK_BONUS_1 = 0.05
 TOP_RANK_BONUS_2_3 = 0.02
 RERANK_INPUT_MAX = 20  # candidates handed to the (paid) reranker per query
+MAX_K = 50  # model-supplied k is clamped: bounds FTS/vec overfetch and output size
 
 # qmd positional blend weights: (max_rank_inclusive, weight_rrf, weight_rerank)
 _BLEND_BUCKETS: List[Tuple[int, float, float]] = [
@@ -332,7 +333,14 @@ def hybrid_search(
     *user_id*: a GUEST identity (None for the owner) — the paid rerank call
     is then checked against and charged to that guest's daily budget.
     """
-    query = (query or "").strip()
+    from . import normalize as normalize_mod
+
+    query = normalize_mod.normalize_query(query or "")
+    try:
+        k = int(k)
+    except (TypeError, ValueError):
+        k = 8
+    k = min(k, MAX_K)
     if not query or k <= 0:
         return []
 
