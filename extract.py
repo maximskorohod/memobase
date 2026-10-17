@@ -44,6 +44,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -120,7 +121,30 @@ def _text_to_blocks(text: str, *, page: Optional[int] = None) -> List[Dict[str, 
 # ---------------------------------------------------------------------------
 
 
+# Parsing caps for LOCAL files (a 2 GB VPS must not be taken down by one
+# oversized/bomb upload): checked before the parser touches the file.
+MAX_LOCAL_FILE_BYTES = 100 * 1024 * 1024
+MAX_PDF_PAGES = 2000
+MAX_DOCX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+MAX_CSV_ROWS = 100_000
+
+
+def _size_refusal(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return _empty_result(f"failed to stat {os.path.basename(path)}: {exc}")
+    if size > MAX_LOCAL_FILE_BYTES:
+        return _empty_result(
+            f"file is {size // (1024 * 1024)} MB, over the {MAX_LOCAL_FILE_BYTES // (1024 * 1024)} MB limit"
+        )
+    return None
+
+
 def _extract_pdf(path: str) -> Dict[str, Any]:
+    refusal = _size_refusal(path)
+    if refusal is not None:
+        return refusal
     skipped: List[Dict[str, str]] = []
     blocks: List[Dict[str, Any]] = []
     title = None
@@ -140,7 +164,11 @@ def _extract_pdf(path: str) -> Dict[str, Any]:
                 page_count = len(pdf.pages)
                 meta = getattr(pdf, "metadata", None) or {}
                 title = meta.get("Title") or None
+                if page_count > MAX_PDF_PAGES:
+                    skipped.append({"reason": f"PDF has {page_count} pages; only the first {MAX_PDF_PAGES} were read"})
                 for i, page in enumerate(pdf.pages, start=1):
+                    if i > MAX_PDF_PAGES:
+                        break
                     try:
                         text = page.extract_text() or ""
                     except Exception as exc:  # noqa: BLE001 - defensive, per-page
@@ -164,6 +192,8 @@ def _extract_pdf(path: str) -> Dict[str, Any]:
             except Exception:  # noqa: BLE001
                 title = None
             for i, page in enumerate(reader.pages, start=1):
+                if i > MAX_PDF_PAGES:
+                    break
                 try:
                     text = page.extract_text() or ""
                 except Exception as exc:  # noqa: BLE001
@@ -192,6 +222,21 @@ def _extract_pdf(path: str) -> Dict[str, Any]:
 
 def _extract_docx(path: str) -> Dict[str, Any]:
     skipped: List[Dict[str, str]] = []
+    refusal = _size_refusal(path)
+    if refusal is not None:
+        return refusal
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(path) as zf:
+            unpacked = sum(info.file_size for info in zf.infolist())
+        if unpacked > MAX_DOCX_UNCOMPRESSED_BYTES:
+            return _empty_result(
+                f"DOCX unpacks to {unpacked // (1024 * 1024)} MB, over the "
+                f"{MAX_DOCX_UNCOMPRESSED_BYTES // (1024 * 1024)} MB limit (zip bomb?)"
+            )
+    except (OSError, zipfile.BadZipFile) as exc:
+        return _empty_result(f"not a valid DOCX (zip) file: {exc}")
     try:
         import mammoth
     except ImportError:
@@ -245,6 +290,9 @@ def _extract_html_or_url(path_or_url: str, *, is_url: bool) -> Dict[str, Any]:
             return _empty_result(f"failed to fetch {path_or_url}: {exc}")
         html_text = raw.decode("utf-8", errors="replace")
     else:
+        refusal = _size_refusal(path_or_url)
+        if refusal is not None:
+            return refusal
         try:
             with open(path_or_url, "r", encoding="utf-8", errors="replace") as f:
                 html_text = f.read()
@@ -292,6 +340,9 @@ def _extract_html_or_url(path_or_url: str, *, is_url: bool) -> Dict[str, Any]:
 
 
 def _extract_plain_text(path: str) -> Dict[str, Any]:
+    refusal = _size_refusal(path)
+    if refusal is not None:
+        return refusal
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
@@ -313,6 +364,9 @@ def _extract_plain_text(path: str) -> Dict[str, Any]:
 
 
 def _extract_csv(path: str) -> Dict[str, Any]:
+    refusal = _size_refusal(path)
+    if refusal is not None:
+        return refusal
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
             raw = f.read()
@@ -325,7 +379,13 @@ def _extract_csv(path: str) -> Dict[str, Any]:
         dialect = csv.excel
 
     reader = csv.reader(io.StringIO(raw), dialect)
-    rows = list(reader)
+    rows = []
+    truncated = False
+    for row in reader:
+        if len(rows) > MAX_CSV_ROWS:  # header + MAX_CSV_ROWS data rows
+            truncated = True
+            break
+        rows.append(row)
     if not rows:
         return _empty_result("CSV file has no rows")
 
@@ -357,6 +417,8 @@ def _extract_csv(path: str) -> Dict[str, Any]:
             }
         )
 
+    if truncated:
+        skipped.append({"reason": f"CSV has more than {MAX_CSV_ROWS} rows; the rest was not read"})
     full_text = "\n\n".join(b["text"] for b in blocks)
     return {
         "text": full_text,

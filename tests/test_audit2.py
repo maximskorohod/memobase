@@ -625,3 +625,71 @@ class TestRerankBreaker:
         assert 429 not in calls[0]["retry_statuses"]
         ranked, mode = kb.rerank.rerank("q", cands, {"rerank": {"enabled": True}})
         assert mode == "rrf-only" and len(calls) == 1  # breaker open: Cohere not hit again
+
+
+# ===========================================================================
+# 12. Memory safety caps
+# ===========================================================================
+
+
+class TestMemoryCaps:
+    def test_groq_size_checked_before_read(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "k")
+        big = tmp_path / "big.flac"
+        with open(big, "wb") as f:
+            f.truncate(kb.stt.GROQ_MAX_BYTES + 1)
+        monkeypatch.setattr(kb.stt, "_request_with_backoff", lambda *a, **k: pytest.fail("must not send"))
+        with pytest.raises(kb.stt.SttError):
+            kb.stt.transcribe_groq(str(big))
+
+    def test_gemini_inline_cap(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        big = tmp_path / "big.flac"
+        with open(big, "wb") as f:
+            f.truncate(kb.stt.GEMINI_MAX_INLINE_BYTES + 1)
+        monkeypatch.setattr(kb.stt, "_request_with_backoff", lambda *a, **k: pytest.fail("must not send"))
+        with pytest.raises(kb.stt.SttError):
+            kb.stt.transcribe_gemini(str(big))
+
+    def test_local_file_size_cap(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setattr(kb.extract, "MAX_LOCAL_FILE_BYTES", 10)
+        p = tmp_path / "a.txt"
+        p.write_text("x" * 100, encoding="utf-8")
+        doc = kb.extract.extract(str(p), "txt")
+        assert doc["text"] == "" and "limit" in doc["skipped"][0]["reason"]
+
+    def test_csv_row_cap(self, kb, tmp_path, monkeypatch):
+        monkeypatch.setattr(kb.extract, "MAX_CSV_ROWS", 3)
+        p = tmp_path / "a.csv"
+        p.write_text("h1,h2\n" + "".join(f"a{i},b{i}\n" for i in range(10)), encoding="utf-8")
+        doc = kb.extract.extract(str(p), "csv")
+        assert doc["meta"]["row_count"] == 3
+        assert any("more than 3 rows" in s["reason"] for s in doc["skipped"])
+
+    def test_ffmpeg_gets_protocol_whitelist(self, kb, monkeypatch):
+        seen = {}
+
+        class P:
+            returncode = 0
+            stderr = b""
+
+        monkeypatch.setattr(kb.stt, "find_ffmpeg", lambda: "ffmpeg")
+        monkeypatch.setattr(kb.stt.subprocess, "run", lambda args, **k: seen.setdefault("args", args) and P())
+        kb.stt._run_ffmpeg(["-i", "in.mp3", "out.flac"])
+        args = seen["args"]
+        assert args[args.index("-protocol_whitelist") + 1] == "file"
+        assert args.index("-protocol_whitelist") < args.index("-i")
+
+    def test_audio_streamed_to_disk(self, kb, monkeypatch, tmp_path):
+        monkeypatch.setattr(kb.youtube, "_apify_run_actor",
+                            lambda actor, run_input, **kw: [{"audioFileUrl": "https://apify.example/a.mp3"}])
+        monkeypatch.setattr(kb.youtube, "safe_get", lambda *a, **k: pytest.fail("must stream to disk"))
+
+        def fake_download(url, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"mp3")
+            return 3
+
+        monkeypatch.setattr(kb.youtube, "safe_download", fake_download)
+        path, name = kb.youtube.download_audio_apify("abcdefghijk", dest_dir=str(tmp_path))
+        assert open(path, "rb").read() == b"mp3" and name == "abcdefghijk.mp3"

@@ -77,7 +77,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import ledger
 from .secrets import get_env
-from .security import DEFAULT_USER_AGENT, describe_request_error, safe_get
+from .security import DEFAULT_USER_AGENT, describe_request_error, safe_download, safe_get
 
 logger = logging.getLogger("memobase.youtube")
 
@@ -721,7 +721,11 @@ def get_transcript(
 # ---------------------------------------------------------------------------
 
 
-def download_audio_apify(video_id: str) -> Tuple[bytes, str]:
+AUDIO_MAX_BYTES = 500 * 1024 * 1024
+AUDIO_DOWNLOAD_DEADLINE_S = 1800.0
+
+
+def download_audio_apify(video_id: str, *, dest_dir: Optional[str] = None) -> Tuple[Any, str]:
     """Download this video's audio via ``lurkapi/youtube-to-mp3-audio-downloader``
     (pay-on-success). Returns ``(audio_bytes, suggested_filename)``. Raises
     :class:`YoutubeError` on any failure — caller (:func:`extract_video`)
@@ -755,8 +759,17 @@ def download_audio_apify(video_id: str) -> Tuple[bytes, str]:
     # backoff is exactly the right shared primitive for "download a file from
     # a URL" regardless of source, so it is reused here rather than
     # reimplemented.
-    audio_bytes = safe_get(audio_url, max_bytes=500 * 1024 * 1024)  # audio files can be large; generous cap
-    return audio_bytes, f"{video_id}.mp3"
+    filename = f"{video_id}.mp3"
+    if dest_dir is not None:
+        # Production path: stream straight to disk — a long video's audio
+        # (up to AUDIO_MAX_BYTES) must never sit in RAM on a 2 GB VPS.
+        dest = os.path.join(dest_dir, filename)
+        safe_download(audio_url, dest, max_bytes=AUDIO_MAX_BYTES, timeout=60.0,
+                      total_timeout=AUDIO_DOWNLOAD_DEADLINE_S)
+        return dest, filename
+    audio_bytes = safe_get(audio_url, max_bytes=AUDIO_MAX_BYTES, timeout=60.0,
+                           total_timeout=AUDIO_DOWNLOAD_DEADLINE_S)
+    return audio_bytes, filename
 
 
 # ---------------------------------------------------------------------------
@@ -882,17 +895,24 @@ def extract_video(
     if segments:
         return build_video_doc(video_meta, segments, provider=provider or "unknown")
 
-    # No captions anywhere -> audio + STT fallback.
+    # No captions anywhere -> audio + STT fallback (audio streamed to a temp
+    # dir on disk, removed afterwards).
+    import shutil
+    import tempfile
+
+    workdir = tempfile.mkdtemp(prefix="hermes_memobase_audio_")
     try:
         from . import stt as stt_mod
 
-        audio_bytes, filename = download_audio_apify(video_id)
-        stt_result = stt_mod.transcribe_long_audio(audio_bytes, filename_hint=filename, memobase_cfg=memobase_cfg)
+        audio, filename = download_audio_apify(video_id, dest_dir=workdir)
+        stt_result = stt_mod.transcribe_long_audio(audio, filename_hint=filename, memobase_cfg=memobase_cfg)
     except Exception as exc:  # noqa: BLE001 - final fallback failure is an honest skip, not a crash
         return {
             "text": "", "blocks": [], "meta": {"title": None, "pages": None},
             "skipped": [{"reason": f"video has no captions and audio/STT fallback failed: {exc}"}],
         }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
     stt_segments = stt_result.get("segments") or []
     if not stt_segments:

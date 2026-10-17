@@ -346,7 +346,7 @@ class TestGetTranscriptTool:
 
     def test_allow_audio_fallback_runs_stt(self, kb, monkeypatch):
         monkeypatch.setattr(kb.youtube, "get_transcript", lambda *a, **k: (None, None))
-        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid: (b"audio", "v.mp3"))
+        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid, **kw: (b"audio", "v.mp3"))
         monkeypatch.setattr(
             kb.stt, "transcribe_long_audio",
             lambda audio, *, filename_hint="audio", memobase_cfg=None: {
@@ -360,7 +360,7 @@ class TestGetTranscriptTool:
 
 class TestDlAudioTool:
     def test_stt_transcript_with_trust_note(self, kb, monkeypatch):
-        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid: (b"audio", "vid.mp3"))
+        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid, **kw: (b"audio", "vid.mp3"))
         monkeypatch.setattr(
             kb.stt,
             "transcribe_long_audio",
@@ -382,7 +382,7 @@ class TestDlAudioTool:
         """Fix C: whatever stt.py raises must not dump a raw provider
         JSON/body into the chat -- the message stays short and still names
         the video id; the full detail only goes to the debug log."""
-        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid: (b"audio", "vid.mp3"))
+        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda vid, **kw: (b"audio", "vid.mp3"))
         huge_message = "RAW PROVIDER JSON " * 60  # simulates a leaked provider body
 
         def fake_transcribe(*a, **k):

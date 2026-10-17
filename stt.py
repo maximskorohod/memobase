@@ -51,6 +51,14 @@ DEFAULT_PRESET = "groq"
 GROQ_MODEL = "whisper-large-v3-turbo"
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MAX_BYTES = 25 * 1024 * 1024
+# Gemini inline_data requests are capped at ~20 MB by the API; base64 adds a
+# third on top — never read a bigger file into memory for it.
+GEMINI_MAX_INLINE_BYTES = 15 * 1024 * 1024
+# Whole-input cap for one STT job (local file or downloaded audio).
+MAX_STT_INPUT_BYTES = 500 * 1024 * 1024
+# ffmpeg/ffprobe may only read local files: a crafted "audio" file (HLS
+# playlist, concat list) must not make them fetch URLs.
+_FFMPEG_SAFE_INPUT_FLAGS = ["-nostdin", "-protocol_whitelist", "file"]
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_URL_TMPL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -99,7 +107,7 @@ def _run_ffmpeg(args: List[str], *, timeout_s: float = 600.0) -> None:
         raise SttError("ffmpeg not found (checked PATH and the local WinGet install path)")
     try:
         proc = subprocess.run(
-            [ffmpeg, "-y", "-loglevel", "error", *args],
+            [ffmpeg, "-y", "-loglevel", "error", *_FFMPEG_SAFE_INPUT_FLAGS, *args],
             capture_output=True, timeout=timeout_s, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -117,7 +125,7 @@ def _probe_duration_s(path: str) -> float:
         ffprobe = "ffprobe"  # hope it's on PATH too
     try:
         proc = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+            [ffprobe, "-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, timeout=60, check=False,
         )
@@ -211,10 +219,11 @@ def transcribe_groq(audio_path: str, *, filename: str = "audio.flac") -> List[Di
     if not api_key:
         raise SttError("GROQ_API_KEY not set in environment")
 
+    size = os.path.getsize(audio_path)  # checked BEFORE reading into memory
+    if size > GROQ_MAX_BYTES:
+        raise SttError(f"{os.path.basename(audio_path)} is {size} bytes, over Groq's {GROQ_MAX_BYTES}-byte limit")
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
-    if len(audio_bytes) > GROQ_MAX_BYTES:
-        raise SttError(f"{audio_path} is {len(audio_bytes)} bytes, over Groq's {GROQ_MAX_BYTES}-byte limit")
 
     headers = {"Authorization": f"Bearer {api_key}"}
     files = {"file": (filename, audio_bytes)}
@@ -270,6 +279,12 @@ def transcribe_gemini(audio_path: str) -> List[Dict[str, Any]]:
     if not api_key:
         raise SttError("GEMINI_API_KEY not set in environment")
 
+    size = os.path.getsize(audio_path)  # checked BEFORE reading into memory
+    if size > GEMINI_MAX_INLINE_BYTES:
+        raise SttError(
+            f"audio is {size // (1024 * 1024)} MB, over the {GEMINI_MAX_INLINE_BYTES // (1024 * 1024)} MB "
+            f"inline limit of the Gemini fallback"
+        )
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
     mime = mimetypes.guess_type(audio_path)[0] or "audio/flac"
@@ -511,6 +526,10 @@ def transcribe_long_audio(
 
     try:
         size = os.path.getsize(input_path)
+        if size > MAX_STT_INPUT_BYTES:
+            raise SttError(
+                f"audio is {size // (1024 * 1024)} MB, over the {MAX_STT_INPUT_BYTES // (1024 * 1024)} MB STT limit"
+            )
         # Probed ONCE, up front, regardless of which path below ends up
         # transcribing -- best-effort (None on failure), see
         # _safe_probe_duration_s. chunk_audio_file() below re-probes this

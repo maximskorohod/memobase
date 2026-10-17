@@ -1628,21 +1628,28 @@ def _format_transcript_segments(segments: List[Dict[str, Any]]) -> str:
 def _audio_stt_output(video_id: str, memobase_cfg: Dict[str, Any]) -> str:
     """Скачать аудио (Apify) + распознать через STT → готовый таймкод-транскрипт.
     Общая начинка memobase_youtube_dl_audio и opt-in фолбэка get_transcript."""
+    import shutil
+    import tempfile
+
     from . import stt as stt_mod
     from . import youtube as youtube_mod
 
+    workdir = tempfile.mkdtemp(prefix="hermes_memobase_audio_")
     try:
-        audio_bytes, filename = youtube_mod.download_audio_apify(video_id)
-    except youtube_mod.YoutubeError as exc:
-        return f"Не удалось скачать аудио видео {video_id}: {exc}"
-    try:
-        stt_result = stt_mod.transcribe_long_audio(audio_bytes, filename_hint=filename, memobase_cfg=memobase_cfg)
-    except Exception as exc:  # noqa: BLE001 - surface STT failure as an honest message, not a crash
-        # Keep the chat message compact (stt.py's own errors are already
-        # short post-fix, but this caps defensively regardless of exception
-        # type) -- the full exception goes to the debug log only.
-        logger.debug("STT fallback failed for video %s", video_id, exc_info=True)
-        return f"STT fallback failed: {str(exc)[:200]} (video {video_id})"
+        try:
+            audio, filename = youtube_mod.download_audio_apify(video_id, dest_dir=workdir)
+        except Exception as exc:  # noqa: BLE001 - YoutubeError / SecurityError / FetchError
+            return f"Не удалось скачать аудио видео {video_id}: {exc}"
+        try:
+            stt_result = stt_mod.transcribe_long_audio(audio, filename_hint=filename, memobase_cfg=memobase_cfg)
+        except Exception as exc:  # noqa: BLE001 - surface STT failure as an honest message, not a crash
+            # Keep the chat message compact (stt.py's own errors are already
+            # short post-fix, but this caps defensively regardless of exception
+            # type) -- the full exception goes to the debug log only.
+            logger.debug("STT fallback failed for video %s", video_id, exc_info=True)
+            return f"STT fallback failed: {str(exc)[:200]} (video {video_id})"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
     segments = stt_result.get("segments") or []
     if not segments:

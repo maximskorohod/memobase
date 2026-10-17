@@ -219,7 +219,7 @@ class TestYoutubeExtractVideoNeverRaises:
 
     def test_no_captions_falls_back_to_audio_stt(self, kb, monkeypatch):
         monkeypatch.setattr(kb.youtube, "get_transcript", lambda video_id, **kw: (None, None))
-        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda video_id: (b"fake-audio-bytes", "v.mp3"))
+        monkeypatch.setattr(kb.youtube, "download_audio_apify", lambda video_id, **kw: (b"fake-audio-bytes", "v.mp3"))
         monkeypatch.setattr(
             kb.stt, "transcribe_long_audio",
             lambda audio, **kw: {"segments": [{"text": "from stt", "start_sec": 0.0, "end_sec": 1.0}], "provider": "groq", "trust": "high", "low_confidence_boundaries": []},
@@ -231,7 +231,7 @@ class TestYoutubeExtractVideoNeverRaises:
     def test_no_captions_and_audio_fallback_fails_is_honest_skip(self, kb, monkeypatch):
         monkeypatch.setattr(kb.youtube, "get_transcript", lambda video_id, **kw: (None, None))
 
-        def audio_fails(video_id):
+        def audio_fails(video_id, **kw):
             raise kb.youtube.YoutubeError("apify audio actor down")
 
         monkeypatch.setattr(kb.youtube, "download_audio_apify", audio_fails)
