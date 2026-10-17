@@ -170,6 +170,10 @@ def iter_markdown_files(vault_path: Path):
     """Yield every ``.md`` file under *vault_path*, skipping
     ``.obsidian/``/``.trash/``/``templates/`` at any depth (case-insensitive)."""
     vault_path = Path(vault_path)
+    try:
+        vault_root = vault_path.resolve()
+    except (OSError, RuntimeError):
+        return
     for root, dirnames, filenames in os.walk(vault_path):
         root_path = Path(root)
         rel = root_path.relative_to(vault_path).parts
@@ -180,7 +184,20 @@ def iter_markdown_files(vault_path: Path):
         dirnames[:] = [d for d in dirnames if d.lower() not in IGNORE_DIR_NAMES]
         for fname in filenames:
             if fname.lower().endswith(".md"):
-                yield root_path / fname
+                candidate = root_path / fname
+                # A `note.md` symlink pointing OUTSIDE the vault (e.g. at
+                # ~/.hermes/.env) must never be read as a "note".
+                if not _resolves_inside(candidate, vault_root):
+                    logger.warning("obsidian: skipping %s (symlink resolves outside the vault)", candidate)
+                    continue
+                yield candidate
+
+
+def _resolves_inside(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve(strict=True).is_relative_to(root)
+    except (OSError, RuntimeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +281,9 @@ def extract_note(path: str) -> Dict[str, Any]:
     from . import extract as extract_mod  # local import: avoid a hard load-order dependency
 
     note_path = Path(path)
+    if note_path.suffix.lower() != ".md":
+        return {"text": "", "blocks": [], "meta": {"title": None, "pages": None},
+                "skipped": [{"reason": f"not an Obsidian note (.md expected): {path}"}]}
     try:
         raw = note_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -300,6 +320,7 @@ def ingest_vault(
     *,
     memobase_cfg: Optional[Dict[str, Any]] = None,
     confirm: bool = False,
+    uploader_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Ingest every note under *vault_path* into *collection_row*, one
     ``documents`` row per note (source_uri = note's absolute path,
@@ -332,7 +353,8 @@ def ingest_vault(
 
     for note_path in note_paths:
         result = ingest_mod.ingest_source(
-            conn, collection_row, str(note_path), "obsidian", memobase_cfg=memobase_cfg, confirm=confirm
+            conn, collection_row, str(note_path), "obsidian", memobase_cfg=memobase_cfg, confirm=confirm,
+            uploader_user_id=uploader_user_id,
         )
         status = result.get("status")
         if status == "done":

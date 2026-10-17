@@ -898,6 +898,7 @@ def ingest_channel(
     *,
     memobase_cfg: Optional[Dict[str, Any]] = None,
     confirm: bool = False,
+    uploader_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """List every video on *channel*, cost-estimate + confirm-gate (per
     ``memobase.youtube.confirm_over_videos``, default 20 — deliberately separate
@@ -952,7 +953,11 @@ def ingest_channel(
     for i, v in enumerate(videos):
         video_title = v.get("title")
         result = ingest_mod.ingest_source(
-            conn, collection_row, v["url"], "youtube", memobase_cfg=memobase_cfg, confirm=True,
+            # The channel-level confirm above already covered the owner; a
+            # guest keeps the per-video chunk threshold (no model-supplied
+            # confirm can lift it).
+            conn, collection_row, v["url"], "youtube", memobase_cfg=memobase_cfg,
+            confirm=uploader_user_id is None, uploader_user_id=uploader_user_id,
             # ingest_channel's own channel listing (_sc_video_entry/
             # channel_videos_apify) already has this video's title -- pass it
             # through as a hint so documents.title doesn't degrade to the bare

@@ -495,6 +495,67 @@ def _estimate_source_mb(source: str, source_type: str) -> float:
         return 0.0
 
 
+# Source types whose `source` is a LOCAL filesystem path (everything except
+# url/youtube). For a guest these are confined to the allowlist below — a
+# model-supplied path must never let a guest read arbitrary files of the host.
+_LOCAL_PATH_SOURCE_TYPES = ("pdf", "docx", "html", "md", "txt", "csv", "audio", "video", "obsidian")
+
+# Where the hermes gateway caches files a user sent into the chat
+# (gateway/platforms/base.py: get_hermes_dir("cache/<kind>", "<kind>_cache")).
+_GATEWAY_ATTACHMENT_SUBDIRS = (
+    "cache/documents", "cache/audio", "cache/videos",
+    "document_cache", "audio_cache", "video_cache",
+)
+
+
+def _guest_ingest_roots(memobase_cfg: Dict[str, Any]) -> List[Any]:
+    """Allowlisted roots for a guest's local-path ingest: the gateway's
+    attachment caches + optional ``memobase.allowed_ingest_roots``."""
+    import os as _os
+    from pathlib import Path as _Path
+
+    roots: List[Any] = []
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        roots.extend(home / sub for sub in _GATEWAY_ATTACHMENT_SUBDIRS)
+    except Exception:  # noqa: BLE001 - no hermes home => only the configured roots
+        logger.debug("memobase: hermes home unavailable for ingest allowlist", exc_info=True)
+    extra = memobase_cfg.get("allowed_ingest_roots") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    for p in extra if isinstance(extra, (list, tuple)) else []:
+        if p:
+            roots.append(_Path(_os.path.expanduser(str(p))))
+    return roots
+
+
+def _guest_local_source(source: str, memobase_cfg: Dict[str, Any]) -> "tuple[Optional[str], Optional[str]]":
+    """Return ``(resolved_path, refusal)`` for a guest's local-path source.
+    The path is fully resolved (symlinks included) and must be a regular
+    file inside one of :func:`_guest_ingest_roots`."""
+    from pathlib import Path as _Path
+
+    try:
+        resolved = _Path(str(source)).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None, "Файл не найден. Пришлите файл в чат и повторите загрузку."
+    if not resolved.is_file():
+        return None, "Гостю можно загружать только отдельные файлы, присланные в чат (не папки)."
+    for root in _guest_ingest_roots(memobase_cfg):
+        try:
+            root_resolved = _Path(root).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_relative_to(root_resolved):
+            return str(resolved), None
+    return None, (
+        "Гостю можно загружать только файлы, присланные в чат (или ссылки) — "
+        "произвольные пути на сервере запрещены."
+    )
+
+
 def _guest_pre_ingest_gate(
     conn, *, user_id: str, collection_row: Dict[str, Any], memobase_cfg: Dict[str, Any],
     source: str, source_type: str,
@@ -566,39 +627,37 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
         is_guest = not security.is_privileged(user_id, memobase_cfg)
         uploader_user_id = user_id if is_guest else None
         if is_guest:
+            # A guest's `confirm` is a model-supplied flag — it must not lift
+            # the owner's confirm_over_chunks/confirm_over_videos thresholds.
+            confirm = False
             gate_refusal = _guest_pre_ingest_gate(
                 conn, user_id=user_id, collection_row=collection_row, memobase_cfg=memobase_cfg,
                 source=source, source_type=source_type,
             )
             if gate_refusal:
                 return gate_refusal
+            if normalized_type in _LOCAL_PATH_SOURCE_TYPES:
+                resolved_source, path_refusal = _guest_local_source(source, memobase_cfg)
+                if path_refusal:
+                    return path_refusal
+                source = resolved_source
 
         # Multi-document orchestrators: a YouTube CHANNEL (not a single
         # video) or an Obsidian VAULT (a directory, not a single .md file)
         # each expand into many `ingest_source` calls (one per
         # video/note) — see youtube.py/obsidian.py module docstrings.
-        #
-        # KNOWN LIMITATION (documented for the integrator): these two
-        # orchestrators don't yet accept an `uploader_user_id` — a guest's
-        # per-video/per-note embed spend and STRICT injection quarantine
-        # gate are therefore NOT individually metered/gated here the way
-        # the direct `ingest_source` path below is. The pre-ingest gate
-        # above (calls/$-already-spent/storage/upload) still applies before
-        # the whole batch starts. Wiring `uploader_user_id` through
-        # youtube.ingest_channel/obsidian.ingest_vault -> their internal
-        # ingest_source() calls is a mechanical follow-up (thread one kwarg
-        # through each) left for a future round.
-        #
-        # `force` has the same limitation: only the direct `ingest_source`
-        # call below honors it today -- a channel/vault source_type ignores
-        # the flag entirely (each item still dedups normally against its own
-        # previous ingest). Folding it into the two orchestrators is the
-        # same kind of mechanical follow-up as `uploader_user_id` above.
+        # `uploader_user_id` is threaded through both, so a guest's
+        # per-item embed spend and STRICT injection quarantine apply exactly
+        # like the direct `ingest_source` path below. `force` is still only
+        # honored by the direct path (each item dedups normally).
         if normalized_type == "youtube":
             from . import youtube as youtube_mod
 
             if youtube_mod.is_channel_source(source):
-                result = youtube_mod.ingest_channel(conn, collection_row, source, memobase_cfg=memobase_cfg, confirm=confirm)
+                result = youtube_mod.ingest_channel(
+                    conn, collection_row, source, memobase_cfg=memobase_cfg, confirm=confirm,
+                    uploader_user_id=uploader_user_id,
+                )
                 if is_guest and result.get("status") == "done":
                     db.record_guest_usage(conn, user_id, calls=1)
                 return _format_multi_item_result(result, name=name, kind="канала")
@@ -606,11 +665,16 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
             import os as _os
 
             if _os.path.isdir(source):
+                if is_guest:
+                    # Unreachable via _guest_local_source (directories are
+                    # refused there) — kept as a second, explicit guard.
+                    return "Загрузка целого Obsidian-vault'а доступна только владельцу базы знаний."
                 from . import obsidian as obsidian_mod
 
-                result = obsidian_mod.ingest_vault(conn, collection_row, source, memobase_cfg=memobase_cfg, confirm=confirm)
-                if is_guest and result.get("status") == "done":
-                    db.record_guest_usage(conn, user_id, calls=1)
+                result = obsidian_mod.ingest_vault(
+                    conn, collection_row, source, memobase_cfg=memobase_cfg, confirm=confirm,
+                    uploader_user_id=uploader_user_id,
+                )
                 return _format_multi_item_result(result, name=name, kind="vault'а")
 
         result = ingest_mod.ingest_source(

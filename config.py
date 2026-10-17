@@ -121,6 +121,10 @@ DEFAULTS: Dict[str, Any] = {
     "guest_rate_limit": {
         "calls_per_minute": 6,
     },
+    # Extra directories a GUEST may ingest local files from, on top of the
+    # gateway's own attachment caches (<HERMES_HOME>/cache/{documents,audio,
+    # videos}). Paths are resolved (symlinks included) before the check.
+    "allowed_ingest_roots": [],
     # Nightly doctor (backup.py, §1.9 gap #9/#19): VACUUM INTO snapshot +
     # rotation + disk-usage alert threshold. `off_vps_command` is an OPTIONAL
     # shell command template (e.g. an rclone invocation) run after each local
