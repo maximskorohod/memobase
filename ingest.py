@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import sqlite3
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import chunk as chunk_mod
@@ -121,6 +122,17 @@ def purge_removed_chunks(
     unit-test directly against a temp ``memobase.db`` without touching extract/
     normalize/chunk/embed at all.
     """
+    with conn:
+        return _purge_removed_chunks_in_tx(
+            conn, collection_id=collection_id, document_id=document_id, keep_hashes=keep_hashes
+        )
+
+
+def _purge_removed_chunks_in_tx(
+    conn, *, collection_id: int, document_id: int, keep_hashes: Set[str]
+) -> List[int]:
+    """Body of :func:`purge_removed_chunks` WITHOUT its own commit — for use
+    inside a caller-owned transaction (ingest_source's single write tx)."""
     rows = conn.execute(
         "SELECT id, content_sha256 FROM chunks "
         "WHERE document_id = ? AND collection_id = ? AND tombstoned_at IS NULL",
@@ -132,15 +144,14 @@ def purge_removed_chunks(
 
     placeholders = ",".join("?" for _ in to_remove)
     now = db.now()
-    with conn:
-        conn.execute(
-            f"UPDATE chunks SET tombstoned_at = ? WHERE id IN ({placeholders})",
-            (now, *to_remove),
-        )
-        conn.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", to_remove)
-        if db.vec_table_exists(conn, collection_id):
-            vec_table = db.vec_table_name(collection_id)
-            conn.execute(f"DELETE FROM {vec_table} WHERE chunk_id IN ({placeholders})", to_remove)
+    conn.execute(
+        f"UPDATE chunks SET tombstoned_at = ? WHERE id IN ({placeholders})",
+        (now, *to_remove),
+    )
+    conn.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", to_remove)
+    if db.vec_table_exists(conn, collection_id):
+        vec_table = db.vec_table_name(collection_id)
+        conn.execute(f"DELETE FROM {vec_table} WHERE chunk_id IN ({placeholders})", to_remove)
     return to_remove
 
 
@@ -510,93 +521,99 @@ def ingest_source(
         for (i, _c), vec in zip(to_embed, vectors):
             new_vectors[i] = vec
 
-    # --- 8. Upsert the document row --------------------------------------------------------
+    # --- 8-10. ONE write transaction: document row + chunks/FTS/vec + purge ---
+    # The document's content_sha256 is what the "unchanged" short-circuit
+    # (step 1) trusts. It used to be committed BEFORE the chunk inserts, so
+    # any failure in between left a document that looked "unchanged" but had
+    # no chunks — forever. Now the hash, the chunks and the purge commit
+    # together or not at all (db.immediate_transaction: explicit BEGIN
+    # IMMEDIATE, rolled back on any exception).
     now = db.now()
     meta = doc.get("meta") or {}
-    if existing_doc is not None:
-        document_id = existing_doc["id"]
-        with conn:
-            conn.execute(
-                """
-                UPDATE documents
-                   SET content_sha256 = ?, title = ?, page_count = ?, ingested_at = ?, superseded_at = NULL
-                 WHERE id = ?
-                """,
-                (content_hash, meta.get("title"), meta.get("pages"), now, document_id),
-            )
-    else:
-        with conn:
-            cur = conn.execute(
-                """
-                INSERT INTO documents(collection_id, source_uri, source_type, content_sha256,
-                                       title, page_count, ingested_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (collection_id, source, source_type, content_hash, meta.get("title"), meta.get("pages"), now),
-            )
-            document_id = int(cur.lastrowid)
-
-    # --- 9. Insert new chunk rows + FTS + vec --------------------------------------------------------
     dims = collection_cfg["embedder"].get("dims")
-    vec_ready = bool(to_embed) and bool(dims) and db.ensure_vec_table(conn, collection_id, dims)
-
     inserted_chunk_ids: List[int] = []
-    with conn:
-        for i, c in to_embed:
-            content_sha = new_hash_by_index[i]
-            lang = normalize_mod.detect_lang(c["text"])
-            page_val = c.get("page_or_timecode")
-            cur = conn.execute(
-                """
-                INSERT INTO chunks(collection_id, document_id, seq, text, content_sha256,
-                                    page_or_timecode, section, lang, embed_signature, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    collection_id,
-                    document_id,
-                    c["seq"],
-                    c["text"],
-                    content_sha,
-                    str(page_val) if page_val is not None else None,
-                    c.get("section"),
-                    lang,
-                    embed_signature,
-                    now,
-                ),
-            )
-            chunk_id = int(cur.lastrowid)
-            inserted_chunk_ids.append(chunk_id)
-
-            text_stem = stem_mod.stem_ru(c["text"])
-            conn.execute(
-                "INSERT INTO chunks_fts(text, text_stem, chunk_id, collection_id) VALUES (?, ?, ?, ?)",
-                (c["text"], text_stem, chunk_id, collection_id),
-            )
-            if vec_ready and i in new_vectors:
-                vec_table = db.vec_table_name(collection_id)
-                conn.execute(
-                    f"INSERT OR REPLACE INTO {vec_table}(chunk_id, embedding) VALUES (?, ?)",
-                    (chunk_id, embed_mod.serialize_vector(new_vectors[i])),
-                )
-            if enrichment_by_index.get(i):
-                # Inlined (not db.record_chunk_enrichment, which opens its own
-                # `with conn:`) — we are already inside this function's own
-                # `with conn:` block for the whole chunk-insert loop, and a
-                # nested `with conn:` would commit early mid-loop.
-                conn.execute(
-                    "INSERT INTO chunk_enrichment(chunk_id, collection_id, enrichment_text, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (chunk_id, collection_id, enrichment_by_index[i], now),
-                )
-
-    # --- 10. Re-ingest purge --------------------------------------------------------
     tombstoned_ids: List[int] = []
-    if existing_doc is not None:
-        keep_hashes = {new_hash_by_index[i] for i, _ in usable}
-        tombstoned_ids = purge_removed_chunks(
-            conn, collection_id=collection_id, document_id=document_id, keep_hashes=keep_hashes
-        )
+    try:
+        # DDL (CREATE VIRTUAL TABLE) stays outside the data transaction.
+        vec_ready = bool(to_embed) and bool(dims) and db.ensure_vec_table(conn, collection_id, dims)
+        with db.immediate_transaction(conn):
+            if existing_doc is not None:
+                document_id = existing_doc["id"]
+                conn.execute(
+                    """
+                    UPDATE documents
+                       SET content_sha256 = ?, title = ?, page_count = ?, ingested_at = ?, superseded_at = NULL
+                     WHERE id = ?
+                    """,
+                    (content_hash, meta.get("title"), meta.get("pages"), now, document_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO documents(collection_id, source_uri, source_type, content_sha256,
+                                           title, page_count, ingested_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (collection_id, source, source_type, content_hash, meta.get("title"), meta.get("pages"), now),
+                )
+                document_id = int(cur.lastrowid)
+
+            for i, c in to_embed:
+                content_sha = new_hash_by_index[i]
+                lang = normalize_mod.detect_lang(c["text"])
+                page_val = c.get("page_or_timecode")
+                cur = conn.execute(
+                    """
+                    INSERT INTO chunks(collection_id, document_id, seq, text, content_sha256,
+                                        page_or_timecode, section, lang, embed_signature, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        collection_id,
+                        document_id,
+                        c["seq"],
+                        c["text"],
+                        content_sha,
+                        str(page_val) if page_val is not None else None,
+                        c.get("section"),
+                        lang,
+                        embed_signature,
+                        now,
+                    ),
+                )
+                chunk_id = int(cur.lastrowid)
+                inserted_chunk_ids.append(chunk_id)
+
+                text_stem = stem_mod.stem_ru(c["text"])
+                conn.execute(
+                    "INSERT INTO chunks_fts(text, text_stem, chunk_id, collection_id) VALUES (?, ?, ?, ?)",
+                    (c["text"], text_stem, chunk_id, collection_id),
+                )
+                if vec_ready and i in new_vectors:
+                    vec_table = db.vec_table_name(collection_id)
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO {vec_table}(chunk_id, embedding) VALUES (?, ?)",
+                        (chunk_id, embed_mod.serialize_vector(new_vectors[i])),
+                    )
+                if enrichment_by_index.get(i):
+                    # Inlined (not db.record_chunk_enrichment, which opens its
+                    # own `with conn:` and would commit this transaction early).
+                    conn.execute(
+                        "INSERT INTO chunk_enrichment(chunk_id, collection_id, enrichment_text, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (chunk_id, collection_id, enrichment_by_index[i], now),
+                    )
+
+            if existing_doc is not None:
+                keep_hashes = {new_hash_by_index[i] for i, _ in usable}
+                tombstoned_ids = _purge_removed_chunks_in_tx(
+                    conn, collection_id=collection_id, document_id=document_id, keep_hashes=keep_hashes
+                )
+    except (sqlite3.Error, db.DbError) as exc:
+        # Nothing of this document was committed (rolled back above); the
+        # embed spend already recorded stays in the ledger (it was paid).
+        logger.error("ingest_source: index write failed for %r", source, exc_info=True)
+        return _fail(f"запись в индекс не удалась ({type(exc).__name__}); документ не изменён")
 
     db.update_ingestion_job(
         conn, job_id, status="done", stage="done", items_done=len(inserted_chunk_ids), items_total=new_chunk_count

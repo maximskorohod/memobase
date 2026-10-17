@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -683,6 +684,12 @@ def memobase_ingest(args: Dict[str, Any], **kwargs: Any) -> str:
         )
     except ingest_mod.IngestError as exc:
         return f"Ошибка загрузки: {exc}"
+    except (db.DbError, sqlite3.Error) as exc:
+        # ingest_source marks its own job failed for index-write errors; this
+        # is the last-resort net for anything else (job bookkeeping, the
+        # orchestrators) so the tool returns an honest message, not a crash.
+        logger.error("memobase_ingest: database error", exc_info=True)
+        return f"Загрузка не удалась: ошибка базы данных ({type(exc).__name__})."
     finally:
         conn.close()
 

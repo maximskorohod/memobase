@@ -262,3 +262,38 @@ class TestAtomicDdl:
             kb.db.migrate(conn)  # idempotent
         finally:
             conn.close()
+
+
+# ===========================================================================
+# 4. Ingest writes are atomic (no "unchanged" document without chunks)
+# ===========================================================================
+
+
+class TestIngestAtomic:
+    def test_failure_mid_insert_leaves_no_unchanged_doc(self, kb, tmp_path, monkeypatch):
+        import sqlite3
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        p = tmp_path / "doc.md"
+        p.write_text("# A\n\nПервый абзац про яблоки.\n\n# B\n\nВторой абзац про груши.", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "atomic", embedder_dims=3)
+            row = kb.db.get_collection_by_id(conn, cid)
+            cfg = kb.config.get_memobase_config_readonly()
+            real_stem = kb.stem.stem_ru
+
+            def boom(text):
+                raise sqlite3.OperationalError("disk I/O error (simulated)")
+
+            monkeypatch.setattr(kb.stem, "stem_ru", boom)
+            res = kb.ingest.ingest_source(conn, row, str(p), "md", memobase_cfg=cfg)
+            assert res["status"] == "failed"
+            assert conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"] == 0
+            job = conn.execute("SELECT status FROM ingestion_jobs WHERE id = ?", (res["job_id"],)).fetchone()
+            assert job["status"] == "failed"
+
+            monkeypatch.setattr(kb.stem, "stem_ru", real_stem)
+            res2 = kb.ingest.ingest_source(conn, row, str(p), "md", memobase_cfg=cfg)
+            assert res2["status"] == "done" and res2["chunks_added"] >= 1
+        finally:
+            conn.close()
