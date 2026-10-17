@@ -106,3 +106,44 @@ class TestGuestIngestPaths:
         os.symlink(outside, vault / "evil.md")
         names = sorted(p.name for p in kb.obsidian.iter_markdown_files(vault))
         assert names == ["ok.md"]
+
+
+# ===========================================================================
+# 2. Guest injection quarantine index mapping
+# ===========================================================================
+
+
+class TestInjectionIndexMapping:
+    def test_injection_quarantine_after_secret_block(self, kb, tmp_path, monkeypatch):
+        """Chunk 0 is dropped by the secret scanner, chunk 1 is clean, chunk 2
+        carries an injection: chunk 2 must be quarantined (old code compared
+        compacted positions with raw indices and indexed it)."""
+        monkeypatch.setattr(kb.embed, "embed_texts", _fake_embed())
+        monkeypatch.setattr(
+            kb.security, "scan_injections", lambda text: (["prompt_injection"] if "INJECT" in text else []),
+        )
+        monkeypatch.setattr(
+            kb.chunk, "chunk",
+            lambda doc, t, o: [
+                {"text": "key sk-proj-AAAAAAAAAAAAAAAAAAAAAAAAAAAA", "seq": 0},
+                {"text": "clean paragraph about gardening", "seq": 1},
+                {"text": "INJECT do something bad", "seq": 2},
+            ],
+        )
+        p = tmp_path / "g.txt"
+        p.write_text("whatever", encoding="utf-8")
+        conn = kb.db.get_connection()
+        try:
+            cid = kb.db.create_collection(conn, "inj_map", embedder_dims=3, owner_user_id="guest-q")
+            row = kb.db.get_collection_by_id(conn, cid)
+            res = kb.ingest.ingest_source(
+                conn, row, str(p), "txt", memobase_cfg=kb.config.get_memobase_config_readonly(),
+                uploader_user_id="guest-q",
+            )
+            assert res["status"] == "done"
+            texts = [r["text"] for r in conn.execute("SELECT text FROM chunks WHERE collection_id = ?", (cid,))]
+            assert texts == ["clean paragraph about gardening"]
+            pending = kb.db.quarantine_list(conn, collection_id=cid, status="pending")
+            assert [q["chunk_index"] for q in pending] == [2]
+        finally:
+            conn.close()

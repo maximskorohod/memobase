@@ -370,7 +370,13 @@ def ingest_source(
     # `usable` for this run — never embedded, never indexed, until approved.
     guest_quarantined_count = 0
     if uploader_user_id is not None:
-        injection_hits = set(_guest_injection_scan([c["text"] for _, c in usable]))
+        # `_guest_injection_scan` returns positions in the list it is given;
+        # map them back to the ORIGINAL raw_chunks indices carried in `usable`
+        # (after the secret scan dropped some chunks the two diverge, and
+        # comparing compacted positions with raw indices let a flagged chunk
+        # slip through unquarantined).
+        hit_positions = _guest_injection_scan([c["text"] for _, c in usable])
+        injection_hits = {usable[pos][0] for pos in hit_positions}
         if injection_hits:
             still_usable = []
             for i, c in usable:
