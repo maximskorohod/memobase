@@ -46,6 +46,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import db
+from .secrets import get_env
 from .security import DEFAULT_USER_AGENT
 
 logger = logging.getLogger("memobase.embed")
@@ -144,8 +145,8 @@ def _request_with_backoff(
 
 
 def _embed_cloudflare(texts: List[str], model: str) -> List[List[float]]:
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
-    api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
+    account_id = get_env("CLOUDFLARE_ACCOUNT_ID")
+    api_token = get_env("CLOUDFLARE_API_TOKEN")
     if not account_id or not api_token:
         raise EmbedError("CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN not set in environment")
 
@@ -300,7 +301,7 @@ def embed_texts(
         if not base_url:
             raise EmbedError("openai-compat embedder requires embedder.base_url in collection config")
         api_key_env = embedder.get("api_key_env", "OPENAI_API_KEY")
-        api_key = embedder.get("api_key") or os.environ.get(api_key_env)
+        api_key = embedder.get("api_key") or get_env(api_key_env)
         vectors = _embed_openai_compat(texts, base_url=base_url, model=model, api_key=api_key)
     else:
         raise EmbedError(f"unknown embedder provider: {provider!r}")

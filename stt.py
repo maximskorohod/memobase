@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .secrets import get_env
 from .security import DEFAULT_USER_AGENT
 
 logger = logging.getLogger("memobase.stt")
@@ -203,7 +204,7 @@ def transcribe_groq(audio_path: str, *, filename: str = "audio.flac") -> List[Di
     Returns ``[{"text","start_sec","end_sec"}, ...]``. Raises
     :class:`SttError` on any failure (missing key, HTTP error, malformed
     response)."""
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = get_env("GROQ_API_KEY")
     if not api_key:
         raise SttError("GROQ_API_KEY not set in environment")
 
@@ -262,7 +263,7 @@ def transcribe_gemini(audio_path: str) -> List[Dict[str, Any]]:
     import base64
     import mimetypes
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = get_env("GEMINI_API_KEY")
     if not api_key:
         raise SttError("GEMINI_API_KEY not set in environment")
 

@@ -226,6 +226,12 @@ def set_memobase_value(dotted_key: str, value: Any) -> None:
     from hermes_cli.config import set_config_value
 
     key = dotted_key if dotted_key.startswith("memobase.") else f"memobase.{dotted_key}"
+    # hermes_cli.config.set_config_value parses a STRING (it calls .strip());
+    # passing an int/bool crashed `hermes memobase setup` in local mode.
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    elif not isinstance(value, str):
+        value = str(value)
     set_config_value(key, value)
 
 

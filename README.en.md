@@ -285,7 +285,7 @@ Fully offline, no live calls at all — add `-m "not integration"`.
 
 ## Limitations
 
-- There is still no fully local (no external API) embedding engine: the question and chunks are sent to the cloud for embedding/reranking. The plumbing exists — you can point the plugin at your own OpenAI-compatible server (`memobase.embedder.provider: openai-compat` + `base_url`). The setup wizard can already record a "local" choice, but the engine behind it doesn't exist yet.
+- Local embedding (`memobase.embedder.provider: local`, fastembed + multilingual-e5-large, ~2.2 GB) works without keys, but reranking (Cohere) stays in the cloud. On hermes 0.22+ fastembed can't be pip-installed into the managed environment — there, local mode currently means your own OpenAI-compatible server (`openai-compat` + `base_url`).
 - No true resume mid-embedding-batch — a job either finishes or restarts from the last completed stage (already-ingested chunks are never lost, thanks to SHA-256 deduplication).
 - `.txt` documents carry no section structure — their chunks come back with `section=None` (no page/section shown on a citation).
 - Cost estimates for external calls are best-effort figures based on public pricing, not guaranteed-accurate billing numbers.

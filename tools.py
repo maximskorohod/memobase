@@ -110,11 +110,49 @@ def bind_session_user(session_id: str, user_id: str) -> None:
         _session_user[session_id] = user_id
 
 
-def get_session_user(session_id: Optional[str]) -> Optional[str]:
-    if not session_id:
+# A messaging-surface turn whose sender could not be resolved is a guest, never
+# the owner: ``security.is_privileged`` treats ``None`` as "plain CLI".
+UNRESOLVED_MESSAGING_USER = "unresolved:messaging"
+
+
+def _context_user_id() -> Optional[str]:
+    """Sender id hermes bound for THIS turn (gateway ContextVar), if any."""
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:  # older hermes / no gateway package
         return None
-    with _identity_lock:
-        return _session_user.get(session_id)
+    try:
+        return get_session_env("HERMES_SESSION_USER_ID", "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _on_messaging_surface() -> bool:
+    try:
+        from gateway.session_context import session_is_messaging_surface
+    except ImportError:
+        return False
+    try:
+        return bool(session_is_messaging_surface())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_session_user(session_id: Optional[str]) -> Optional[str]:
+    """Identity for ACL/quota checks: hermes' per-turn session context first
+    (correct from the very first message, survives /new and compression), then
+    the best-effort session binding, then deny-by-default on messaging surfaces."""
+    user_id = _context_user_id()
+    if user_id:
+        return user_id
+    if session_id:
+        with _identity_lock:
+            bound = _session_user.get(session_id)
+        if bound:
+            return bound
+    if _on_messaging_surface():
+        return UNRESOLVED_MESSAGING_USER
+    return None
 
 
 def clear_session_user(session_id: str) -> None:

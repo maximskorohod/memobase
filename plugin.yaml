@@ -18,6 +18,23 @@ kind: standalone
 # upstream change; until then, tools.py/cli.py should self-check compatible
 # hermes-core internals defensively at runtime instead of trusting this field.
 hermes_core_min_version: "0.18.0"
+requires_hermes: ">=0.18.0"
+
+# hermes >= 0.22 builds these into its managed environment on enable and keeps
+# them across `hermes update` (packages pip-installed by hand are wiped by the
+# next environment rebuild). fastembed (embedder.provider: local) is optional
+# and deliberately not listed -- it is a ~2 GB model download.
+python_dependencies:
+  - sqlite-vec
+  - pdfplumber
+  - pypdf
+  - mammoth
+  - trafilatura
+  - ftfy
+  - py3langid
+  - PyStemmer
+  - requests
+  - PyYAML  # obsidian frontmatter
 
 # Informational only — hermes does not validate
 # or auto-configure these; they must already exist in ~/.hermes/.env for the
@@ -48,6 +65,7 @@ provides_tools:
   - memobase_list
   - memobase_delete
   - memobase_status
+  - memobase_list_documents
   - memobase_selfcheck
   - memobase_map
   # MULTIUSER admin tools — owner/privileged-only, refused in code (not by prompt)
@@ -58,6 +76,9 @@ provides_tools:
   - memobase_set_guest_quota
   - memobase_quarantine_list
   - memobase_quarantine_review
+  - memobase_youtube_list_channel
+  - memobase_youtube_get_transcript
+  - memobase_youtube_dl_audio
 
 # subagent_start: session -> collection binding registry (tools.py) auto-binds
 # a freshly-delegated "librarian" child to a fixed collection, via a

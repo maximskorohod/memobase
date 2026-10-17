@@ -42,6 +42,36 @@ for arg in "$@"; do
     esac
 done
 
+# --- hermes >= 0.22: package-manager install -------------------------------
+# `hermes` launches a bundled Python whose environment `hermes pm` rebuilds on
+# every update: pip-installing into it (or into the old hermes-agent/venv) is
+# wiped or never seen. So on 0.22+ copy the plugin and let hermes enable it --
+# python_dependencies from plugin.yaml go through hermes' own package manager.
+if command -v hermes >/dev/null 2>&1 && hermes --print-runtime-command >/dev/null 2>&1; then
+    SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+    DEST_DIR="${HERMES_HOME:-$HOME/.hermes}/plugins/memobase"
+    mkdir -p "$DEST_DIR"
+    if [ "$(cd "$DEST_DIR" && pwd -P)" != "$SRC_DIR" ]; then
+        echo "MemoBase: копирую плагин в $DEST_DIR"
+        cp -R "$SRC_DIR"/. "$DEST_DIR"/
+        rm -rf "$DEST_DIR/.git"
+        find "$DEST_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    fi
+    if [ "$INSTALL_LOCAL" = "1" ]; then
+        echo "MemoBase: --local на hermes 0.22+ установщиком пока не поддержан (fastembed нельзя"
+        echo "  поставить pip'ом в управляемое окружение). Используйте Cloudflare или openai-compat."
+    fi
+    if [ "$NO_CONFIG" = "1" ]; then
+        echo "MemoBase: --no-config — включите сами: hermes plugins enable memobase"
+    else
+        echo "MemoBase: включаю плагин и ставлю зависимости через пакетный менеджер hermes..."
+        hermes plugins enable memobase
+    fi
+    echo ""
+    echo "Готово. Дальше: hermes gateway restart (если работает гейтвей), затем /memobase status"
+    exit 0
+fi
+
 resolve_hermes_venv_python() {
     if [ -n "$PYTHON_OVERRIDE" ]; then
         if [ -x "$PYTHON_OVERRIDE" ]; then

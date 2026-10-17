@@ -75,6 +75,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .secrets import get_env
 from .security import DEFAULT_USER_AGENT, safe_get
 
 logger = logging.getLogger("memobase.youtube")
@@ -223,7 +224,7 @@ def _request_with_backoff(method: str, url: str, *, headers: Optional[Dict[str, 
 
 
 def _sc_api_key() -> str:
-    key = os.environ.get("SCRAPECREATORS_API_KEY")
+    key = get_env("SCRAPECREATORS_API_KEY")
     if not key:
         raise YoutubeError("SCRAPECREATORS_API_KEY not set in environment")
     return key
@@ -300,7 +301,7 @@ def channel_videos_scrapecreators(channel: str, *, max_pages: Optional[int] = No
 
 
 def _apify_token() -> str:
-    token = os.environ.get("APIFY_TOKEN")
+    token = get_env("APIFY_TOKEN")
     if not token:
         raise YoutubeError("APIFY_TOKEN not set in environment")
     return token
