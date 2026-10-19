@@ -12,7 +12,7 @@ Two presets (``memobase.stt.preset``, default ``"groq"``):
     overlap window (explicitly NOT fuzzy string matching) with timestamps
     offset by each chunk's start and low-confidence
     merges flagged rather than silently guessed.
-  * **Gemini** ``gemini-2.5-flash-lite`` (fallback, on Groq 429/quota/missing
+  * **Gemini** ``gemini-flash-lite-latest`` (fallback, on Groq 429/quota/missing
     key) — whole file up to ~9.5h, no chunking; its timecodes are
     model-*reported* text (drift on long audio, per Google's own forum
     discussion) so results from this path are tagged ``trust="low"``.
@@ -59,7 +59,7 @@ MAX_STT_INPUT_BYTES = 500 * 1024 * 1024
 # ffmpeg/ffprobe may only read local files: a crafted "audio" file (HLS
 # playlist, concat list) must not make them fetch URLs.
 _FFMPEG_SAFE_INPUT_FLAGS = ["-nostdin", "-protocol_whitelist", "file"]
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-flash-lite-latest"
 GEMINI_URL_TMPL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
@@ -267,7 +267,7 @@ def transcribe_groq(audio_path: str, *, filename: str = "audio.flac") -> List[Di
 
 
 def transcribe_gemini(audio_path: str) -> List[Dict[str, Any]]:
-    """Whole-file fallback via ``gemini-2.5-flash-lite``. Prompts the model
+    """Whole-file fallback via ``gemini-flash-lite-latest``. Prompts the model
     to emit ``[MM:SS] text`` lines; timecodes are model-reported (not
     decoder-derived) and DRIFT on long audio per Google's own forum
     discussion (see module docstring) — callers must tag results from this

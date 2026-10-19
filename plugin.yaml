@@ -51,7 +51,7 @@ requires_env:
   - SCRAPECREATORS_API_KEY  # youtube.py: channel listing + transcripts (primary)
   - APIFY_TOKEN             # youtube.py: transcript/channel-listing fallback + audio download
   - GROQ_API_KEY            # stt.py: whisper-large-v3-turbo (default STT preset)
-  - GEMINI_API_KEY          # stt.py: gemini-2.5-flash-lite (STT fallback preset)
+  - GEMINI_API_KEY          # stt.py: gemini-flash-lite-latest (STT fallback preset)
 
 # Declared ahead of implementation so the manifest documents the full v1
 # surface from DESIGN_v1.md even though tools.py/commands.py/cli.py (which

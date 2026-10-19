@@ -76,7 +76,7 @@ DEFAULTS: Dict[str, Any] = {
         "max_videos": 200,
     },
     # STT preset (stt.py): "groq" (default, whisper-large-v3-turbo) or
-    # "gemini" (gemini-2.5-flash-lite, used automatically as a fallback on
+    # "gemini" (gemini-flash-lite-latest, used automatically as a fallback on
     # Groq failure regardless of this setting — this only picks which one
     # is tried FIRST).
     "stt": {

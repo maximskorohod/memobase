@@ -56,7 +56,7 @@ _PRICING_USD: dict = {
     ("scrapecreators", "request"): 0.0,  # credit-based; recorded for visibility only
     # STT, $ per second of audio
     ("groq", "stt"): 0.04 / 3600.0,      # whisper-large-v3-turbo, $0.04/hour
-    ("gemini", "stt"): 0.00001,          # gemini-2.5-flash-lite audio input, ~32 tok/s
+    ("gemini", "stt"): 0.00001,          # gemini-flash-lite-latest audio input, ~32 tok/s
 }
 
 _DEFAULT_FALLBACK_PRICE = 0.0  # unknown (provider, op): estimate as free rather than guess wildly
