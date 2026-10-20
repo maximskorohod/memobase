@@ -42,6 +42,55 @@ for arg in "$@"; do
     esac
 done
 
+# --- Dependencies in the environment hermes actually runs ------------------
+# plugin.yaml's pip_dependencies are built into the managed env only on
+# `hermes update`; right after a fresh install they are missing, and memory
+# silently degrades (no vector search, no RU stemming). So: ask hermes for its
+# site-packages, check every module, install what's missing with hermes' own
+# uv. Args: "<label>" then "module:pip-spec" pairs. Never fails the install.
+ensure_runtime_deps() {
+    local label="$1"; shift
+    local sp venv py uv missing pkgs pair
+    sp="$(hermes --run-module site 2>/dev/null | grep -i "site-packages" | grep -iE "venv" | head -1 \
+        | sed -E "s/^[[:space:]]*'//; s/',?[[:space:]]*$//")"
+    venv="$(printf '%s' "$sp" | sed -E 's#(.*[/\\]venv)[/\\].*#\1#')"
+    py=""
+    for cand in "$venv/bin/python" "$venv/Scripts/python.exe"; do
+        [ -n "$venv" ] && [ -x "$cand" ] && { py="$cand"; break; }
+    done
+    if [ -z "$py" ]; then
+        echo "$label: не нашёл окружение hermes — проверьте пакеты сами: hermes memory setup"
+        return 0
+    fi
+    _missing() {
+        local out="" pair
+        for pair in "$@"; do
+            "$py" -c "import importlib.util,sys; sys.exit(importlib.util.find_spec('${pair%%:*}') is None)" 2>/dev/null \
+                || out="$out ${pair#*:}"
+        done
+        printf '%s' "$out"
+    }
+    missing="$(_missing "$@")"
+    if [ -z "$missing" ]; then
+        echo "$label: все пакеты на месте"
+        return 0
+    fi
+    echo "$label: не хватает пакетов:$missing — ставлю в $py"
+    uv="$(ls -d "${HERMES_HOME:-$HOME/.hermes}"/tools/uv-*/uv* 2>/dev/null | head -1)"
+    # shellcheck disable=SC2086
+    if [ -n "$uv" ]; then
+        "$uv" pip install -q --python "$py" $missing || true
+    else
+        "$py" -m pip install -q $missing || true
+    fi
+    missing="$(_missing "$@")"
+    if [ -z "$missing" ]; then
+        echo "$label: пакеты установлены"
+    else
+        echo "$label: ВНИМАНИЕ, не встали:$missing — память работает урезанно"
+    fi
+}
+
 # --- hermes >= 0.22: package-manager install -------------------------------
 # `hermes` launches a bundled Python whose environment `hermes pm` rebuilds on
 # every update: pip-installing into it (or into the old hermes-agent/venv) is
@@ -67,6 +116,7 @@ if command -v hermes >/dev/null 2>&1 && hermes --print-runtime-command >/dev/nul
         echo "MemoBase: включаю плагин и ставлю зависимости через пакетный менеджер hermes..."
         hermes plugins enable memobase
     fi
+    ensure_runtime_deps "MemoBase" sqlite_vec:sqlite-vec pdfplumber:pdfplumber pypdf:pypdf mammoth:mammoth         trafilatura:"trafilatura>=1.8" ftfy:ftfy py3langid:py3langid Stemmer:PyStemmer requests:requests yaml:PyYAML
     echo ""
     echo "Готово. Дальше: hermes gateway restart (если работает гейтвей), затем /memobase status"
     exit 0
